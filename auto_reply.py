@@ -789,6 +789,10 @@ def _handle_new_messages(
     timeline = list(history)
     sent_context: list[dict[str, str]] = []
     for current in pending:
+        print(
+            f"[MESSAGE] Incoming from {contact['name']}: {current['text'][:300]}",
+            flush=True,
+        )
         current_index = next(
             (index for index, message in enumerate(history) if message["id"] == current["id"]),
             len(history),
@@ -1021,13 +1025,60 @@ def main() -> None:
                 install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
                 continue
 
-            event_phones = {
-                str(event.get("phone"))
-                for event in events
-                if event.get("type") in {"incoming", "unread_contact"}
-                and str(event.get("phone")) in contacts_by_phone
-            }
-            pending_contacts.update(event_phones)
+            if events:
+                for event in events:
+                    event_type = event.get("type")
+                    phone = str(event.get("phone") or "")
+                    contact = contacts_by_phone.get(phone)
+                    if event_type == "incoming":
+                        print(
+                            f"[EVENT] Incoming DOM message | "
+                            f"{contact['name'] if contact else phone} | "
+                            f"{str(event.get('text', ''))[:250]}",
+                            flush=True,
+                        )
+                    elif event_type in {"unread_contact", "chat_changed"}:
+                        print(
+                            f"[EVENT] WhatsApp chat-list change | "
+                            f"{contact['name'] if contact else phone} | type={event_type}",
+                            flush=True,
+                        )
+                    elif event_type == "dom_changed":
+                        print(
+                            f"[EVENT] Chat DOM changed | {contact['name'] if contact else phone}",
+                            flush=True,
+                        )
+                event_phones = {
+                    str(event.get("phone"))
+                    for event in events
+                    if event.get("type") in {
+                        "incoming", "unread_contact", "chat_changed", "dom_changed"
+                    }
+                    and str(event.get("phone")) in contacts_by_phone
+                }
+                pending_contacts.update(event_phones)
+            else:
+                try:
+                    status = _observer_status(driver)
+                    if not status.get("installed"):
+                        print("[OBSERVER] Missing after wait; reinstalling.", flush=True)
+                        install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
+                    else:
+                        print(
+                            "[WAIT] Alive | active={active} | incoming_nodes={incoming} | "
+                            "message_containers={containers} | mutations={mutations} | "
+                            "matched_rows={rows} | header={header}".format(
+                                active=status.get("activePhone") or "none",
+                                incoming=status.get("incomingNodes", 0),
+                                containers=status.get("messageContainers", 0),
+                                mutations=status.get("mutations", 0),
+                                rows=status.get("matchedRows", 0),
+                                header=repr(status.get("headerText", "")),
+                            ),
+                            flush=True,
+                        )
+                except WebDriverException as error:
+                    print(f"[DIAGNOSTIC ERROR] Observer status read failed: {error}", flush=True)
 
     except (EOFError, KeyboardInterrupt):
         print("\nAutoChatBot band ho gaya.")
