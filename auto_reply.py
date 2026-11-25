@@ -217,9 +217,28 @@ const scan = () => {
   }
   state.initialized = true;
 };
-const scheduleScan = () => {
+const scheduleScan = records => {
   state.stats.mutations += 1;
   state.stats.lastMutationAt = Date.now();
+  const relevant = (records || []).some(record => {
+    const target = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+    if (target?.closest?.("#main, #pane-side")) return true;
+    for (const node of Array.from(record.addedNodes || [])) {
+      if (node.nodeType !== 1) continue;
+      if (node.matches?.("#main, #pane-side") || node.closest?.("#main, #pane-side")) return true;
+    }
+    return false;
+  });
+  const now = Date.now();
+  if (relevant && state.activePhone && now - (state.stats.lastWakeAt || 0) >= 350) {
+    state.stats.lastWakeAt = now;
+    pushEvent({
+      type: "dom_changed",
+      phone: state.activePhone,
+      snapshot: String(Math.floor(now / 350)),
+      observed_at: now
+    });
+  }
   if (state.scheduled) return;
   state.scheduled = true;
   queueMicrotask(() => {
