@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import auto_reply
 import draft_reply
+import enable_live_autoreply
 
 
 class PhoneNormalizationTests(unittest.TestCase):
@@ -50,6 +51,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(contacts), 1)
         self.assertFalse(contacts[0]["auto_send"])
         self.assertEqual(contacts[0]["whatsapp_name"], "Exact WhatsApp title")
+        self.assertEqual(contacts[0]["tone"], "casual, natural and understated")
         self.assertEqual(history_limit, 15)
         self.assertEqual(memory_limit, 15)
 
@@ -141,6 +143,8 @@ class RecentMessageArrayTests(unittest.TestCase):
         self.assertIn("Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
         self.assertIn("Do not add emojis by default", draft_reply.SYSTEM_PROMPT)
         self.assertIn("casual Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
+        self.assertIn("never flirt", draft_reply.SYSTEM_PROMPT)
+        self.assertIn("Never use pet names", draft_reply.SYSTEM_PROMPT)
         self.assertIn("Never exceed 300 characters", draft_reply.SYSTEM_PROMPT)
         self.assertEqual(draft_reply.MAX_REPLY_CHARS, 300)
 
@@ -188,6 +192,26 @@ class DirectionClassificationTests(unittest.TestCase):
             auto_reply._classify_message_direction(False, False, None, None, 0, 1000),
             "unknown",
         )
+
+
+class StableMessageIdentityTests(unittest.TestCase):
+    def test_timestamp_sender_metadata_survives_whatsapp_wrapper_rerender(self):
+        driver = Mock()
+        driver.execute_script.side_effect = [
+            {"stableId": "wrapper-a", "metadata": "[02:01, 26/11/2026] Friend:"},
+            {"stableId": "wrapper-b", "metadata": "[02:01, 26/11/2026] Friend:"},
+        ]
+        first = auto_reply._message_identity(driver, object(), "incoming", "Kya kr rhe ho")
+        second = auto_reply._message_identity(driver, object(), "incoming", "Kya kr rhe ho")
+        self.assertEqual(first, second)
+
+    def test_message_identity_falls_back_to_whatsapp_stable_id(self):
+        driver = Mock()
+        driver.execute_script.return_value = {"stableId": "message-id-1", "metadata": ""}
+        value = auto_reply._message_identity(driver, object(), "incoming", "Hi")
+        self.assertIsInstance(value, str)
+        self.assertEqual(len(value), 64)
+
 
 
 class LatestPendingReplyTests(unittest.TestCase):
@@ -271,6 +295,77 @@ class MessageStateTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in merged], ["a", "b", "c"])
 
 
+class LiveModeConfigTests(unittest.TestCase):
+    def _write_config(self, directory: str, payload: dict) -> Path:
+        path = Path(directory) / "contacts.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_enabling_live_updates_only_one_exact_enabled_contact_and_backs_up(self):
+        payload = {
+            "dry_run": True,
+            "contacts": [
+                {
+                    "name": "Testing number",
+                    "enabled": True,
+                    "auto_send": False,
+                    "tone": "warm and natural",
+                },
+                {"name": "Other", "enabled": False, "auto_send": False},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(directory, payload)
+            backup = enable_live_autoreply.update_live_mode(
+                path, "Testing number", enable_live=True
+            )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            before = json.loads(backup.read_text(encoding="utf-8"))
+
+        self.assertTrue(backup.is_file())
+        self.assertTrue(before["dry_run"])
+        self.assertFalse(saved["dry_run"])
+        self.assertTrue(saved["contacts"][0]["auto_send"])
+        self.assertEqual(saved["contacts"][0]["tone"], "casual, natural and understated")
+        self.assertFalse(saved["contacts"][1]["auto_send"])
+
+    def test_live_enable_refuses_more_than_one_enabled_contact_without_changes(self):
+        payload = {
+            "dry_run": True,
+            "contacts": [
+                {"name": "Testing number", "enabled": True, "auto_send": False},
+                {"name": "Other", "enabled": True, "auto_send": False},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(directory, payload)
+            with self.assertRaisesRegex(ValueError, "exactly one contact"):
+                enable_live_autoreply.update_live_mode(
+                    path, "Testing number", enable_live=True
+                )
+            after = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(after["dry_run"])
+        self.assertFalse(after["contacts"][0]["auto_send"])
+
+    def test_disable_live_restores_dry_run_for_every_contact(self):
+        payload = {
+            "dry_run": False,
+            "contacts": [
+                {"name": "A", "enabled": True, "auto_send": True},
+                {"name": "B", "enabled": True, "auto_send": True},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(directory, payload)
+            enable_live_autoreply.update_live_mode(path, None, enable_live=False)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(saved["dry_run"])
+        self.assertTrue(all(not item["auto_send"] for item in saved["contacts"]))
+
+
+
 class GroqRetryTests(unittest.TestCase):
     class FakeClient:
         def __init__(self, create):
@@ -285,21 +380,28 @@ class GroqRetryTests(unittest.TestCase):
             return False
 
     @staticmethod
-    def _completion(text):
+    def _completion(text, finish_reason="stop", completion_tokens=25):
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=text, refusal=None),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=SimpleNamespace(completion_tokens=completion_tokens),
         )
 
     def test_network_failure_retries_once_and_returns_reply(self):
         calls = {"count": 0}
         options = {}
+        request_options = {}
 
         class FakeConnectionError(Exception):
             pass
 
         def fake_create(**kwargs):
             self.assertEqual(kwargs["model"], draft_reply.MODEL)
-            self.assertEqual(kwargs["max_completion_tokens"], 180)
+            request_options.update(kwargs)
             calls["count"] += 1
             if calls["count"] == 1:
                 raise FakeConnectionError("temporary network problem")
@@ -323,6 +425,10 @@ class GroqRetryTests(unittest.TestCase):
         self.assertEqual(calls["count"], 2)
         self.assertEqual(options["max_retries"], 0)
         self.assertEqual(options["timeout"], draft_reply.REQUEST_TIMEOUT_SECONDS)
+        self.assertEqual(request_options["max_completion_tokens"], 1024)
+        self.assertEqual(request_options["reasoning_effort"], "low")
+        self.assertFalse(request_options["include_reasoning"])
+        self.assertAlmostEqual(request_options["temperature"], 0.6)
 
     def test_cloudflare_403_is_not_retried(self):
         calls = {"count": 0}
@@ -353,6 +459,42 @@ class GroqRetryTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 403)
         self.assertFalse(caught.exception.retryable)
         self.assertEqual(calls["count"], 1)
+
+
+    def test_blank_truncated_gpt_oss_completion_is_reported_without_retries(self):
+        calls = {"count": 0}
+
+        def fake_create(**_kwargs):
+            calls["count"] += 1
+            return self._completion("", finish_reason="length", completion_tokens=1024)
+
+        with patch.object(draft_reply, "Groq", return_value=self.FakeClient(fake_create)):
+            with self.assertRaises(draft_reply.GroqAPIError) as caught:
+                draft_reply.make_draft("test-key", "Hello", "", "casual")
+
+        self.assertFalse(caught.exception.retryable)
+        self.assertIn("finish_reason=length", str(caught.exception))
+        self.assertEqual(calls["count"], 1)
+
+    def test_affectionate_draft_is_regenerated_before_being_returned(self):
+        replies = iter([
+            "Bas tumhare khayal mein hi hoon, jaan.",
+            "Kuch nahi, tum batao?",
+        ])
+        request_messages = []
+
+        def fake_create(**kwargs):
+            request_messages.append([dict(item) for item in kwargs["messages"]])
+            return self._completion(next(replies))
+
+        with patch.object(draft_reply, "Groq", return_value=self.FakeClient(fake_create)):
+            result = draft_reply.make_draft(
+                "test-key", "Kya kr rhe ho?", "Relationship: friend", "casual"
+            )
+
+        self.assertEqual(result, "Kuch nahi, tum batao?")
+        self.assertEqual(len(request_messages), 2)
+        self.assertIn("STYLE VALIDATION FAILED", request_messages[1][-1]["content"])
 
     def test_empty_input_is_rejected_without_network(self):
         with patch.object(draft_reply, "Groq") as groq_client:
