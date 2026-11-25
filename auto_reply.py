@@ -691,10 +691,16 @@ def _handle_new_messages(
         return
 
     timeline = list(history)
+    sent_context: list[dict[str, str]] = []
     for current in pending:
+        current_index = next(
+            (index for index, message in enumerate(history) if message["id"] == current["id"]),
+            len(history),
+        )
+        prior_messages = history[:current_index] + sent_context
         prompt_history = [
             {"speaker": message["speaker"], "text": message["text"]}
-            for message in timeline if message["id"] != current["id"]
+            for message in prior_messages
         ][-history_limit:]
 
         # The processed marker advances only after a draft/review/send outcome.
@@ -740,6 +746,7 @@ def _handle_new_messages(
             "text": " ".join(draft.split())[:MAX_MESSAGE_CHARS],
         }
         timeline.append(assistant_message)
+        sent_context.append(assistant_message)
         state["last_processed_id"] = current["id"]
         state["history"] = timeline[-memory_limit:]
         _write_state(contact["phone_e164"], state)
