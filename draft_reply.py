@@ -18,14 +18,14 @@ DEFAULT_MODEL = "openai/gpt-oss-20b"
 MODEL = os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 HUMAN_REVIEW_REQUIRED = "__HUMAN_REVIEW_REQUIRED__"
-MAX_REPLY_CHARS = 700
+MAX_REPLY_CHARS = 300
 RECENT_CONTEXT_MESSAGES = 15
 REQUEST_TIMEOUT_SECONDS = 25
 MAX_ATTEMPTS = 3
 
 TONES = {
-    "1": "warm, affectionate and sweet",
-    "2": "caring, calm and reassuring",
+    "1": "warm, simple and friendly",
+    "2": "caring, calm and simple",
     "3": "light, friendly and playful",
 }
 
@@ -203,7 +203,7 @@ def make_draft(
                 result = client.chat.completions.create(
                     model=MODEL,
                     messages=messages,
-                    temperature=0.65,
+                    temperature=0.45,
                     max_completion_tokens=180,
                 )
                 draft = (result.choices[0].message.content or "").strip()
