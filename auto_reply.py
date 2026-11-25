@@ -422,6 +422,38 @@ def install_dom_observer(driver, contacts: list[dict], active_phone: str | None,
     )
     if not isinstance(result, dict) or not result.get("installed"):
         raise RuntimeError(f"WhatsApp DOM observer install nahi hua: {result}")
+    active = result.get("activePhone") or active_phone or "unknown"
+    print(
+        f"[OBSERVER] Installed | active={active} | "
+        f"incoming_nodes={result.get('incomingNodes', 0)} | "
+        f"outgoing_nodes={result.get('outgoingNodes', 0)} | "
+        f"matched_contact_rows={result.get('matchedRows', 0)}",
+        flush=True,
+    )
+
+
+def _observer_status(driver) -> dict:
+    return driver.execute_script(
+        """
+        const state = window.__autochatObserver;
+        const main = document.querySelector('#main');
+        const header = main?.querySelector('header');
+        return {
+          installed: Boolean(state?.observer),
+          activePhone: state?.stats?.activePhone || state?.activePhone || null,
+          scans: state?.stats?.scans || 0,
+          mutations: state?.stats?.mutations || 0,
+          incomingNodes: main?.querySelectorAll('.message-in').length || 0,
+          outgoingNodes: main?.querySelectorAll('.message-out').length || 0,
+          messageContainers: main?.querySelectorAll('[data-testid="msg-container"]').length || 0,
+          paneRows: document.querySelectorAll('#pane-side [data-testid="cell-frame-container"]').length || 0,
+          matchedRows: state?.stats?.matchedRows || 0,
+          lastMutationAt: state?.stats?.lastMutationAt || 0,
+          headerText: (header?.innerText || '').trim().slice(0, 100),
+          url: location.href
+        };
+        """
+    )
 
 
 def wait_for_dom_events(driver, timeout_seconds: float = OBSERVER_WAIT_SECONDS) -> list[dict]:
