@@ -1,8 +1,8 @@
 {
   "country_code": "91",
   "dry_run": true,
-  "history_messages": 10,
-  "memory_messages": 10,
+  "history_messages": 15,
+  "memory_messages": 15,
   "contacts": [
     {
       "phone": "9876543210",
