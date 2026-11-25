@@ -56,7 +56,9 @@ const takeEvents = () => {
 const state = {
   contacts, activePhone, events: [], waiters: [], seenMessages: new Set(),
   rowSnapshots: new Map(), initialized: false, observer: null,
-  scheduled: false, eventKeys: new Set()
+  scheduled: false, eventKeys: new Set(),
+  stats: {scans: 0, mutations: 0, lastMutationAt: Date.now(), incomingNodes: 0,
+          outgoingNodes: 0, matchedRows: 0, activePhone: activePhone}
 };
 window.__autochatObserver = state;
 
@@ -102,12 +104,19 @@ const messageIdentity = element => {
     : (element.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "");
 };
 const activeContact = () => {
-  const header = document.querySelector('#main header [data-testid="conversation-header"] [title], #main header span[title], [data-testid="conversation-header"] [title]');
+  const header = document.querySelector('#main header');
   if (header) {
-    // If a person manually changes chats, never attribute that chat to the last
-    // automated contact. Unmapped titles are deliberately ignored.
-    return contactForLabel(header.getAttribute("title"));
+    const titleCandidates = [
+      ...Array.from(header.querySelectorAll('[title]'), n => n.getAttribute('title') || ''),
+      ...Array.from(header.querySelectorAll('[aria-label]'), n => n.getAttribute('aria-label') || '')
+    ];
+    for (const title of titleCandidates) {
+      const match = contactForLabel(title);
+      if (match) return match;
+    }
   }
+  // Selenium navigates to an explicitly configured phone number before setting
+  // the observer. WhatsApp may render an avatar/status title we cannot map.
   return state.activePhone
     ? (contacts.find(c => c.phone_e164 === state.activePhone) || null)
     : null;
@@ -125,17 +134,25 @@ const unreadPresent = row => {
   return /\bunread\b|\bnew messages?\b/i.test(accessible);
 };
 const rowLabel = row => {
-  const titleNode =
-    row.querySelector('[data-testid="cell-frame-title"][title]') ||
-    row.querySelector('span[title]') ||
-    row.querySelector('[title]');
-  if (titleNode?.getAttribute("title")) return titleNode.getAttribute("title");
-  return row.querySelector("[aria-label]")?.getAttribute("aria-label") || "";
+  const candidates = [
+    ...Array.from(row.querySelectorAll('[data-testid="cell-frame-title"][title]'), n => n.getAttribute('title') || ''),
+    ...Array.from(row.querySelectorAll('span[title], [title]'), n => n.getAttribute('title') || ''),
+    ...Array.from(row.querySelectorAll('[aria-label]'), n => n.getAttribute('aria-label') || '')
+  ];
+  for (const candidate of candidates) {
+    const match = contactForLabel(candidate);
+    if (match) return match.whatsapp_name;
+  }
+  return candidates.find(Boolean) || '';
 };
 const scan = () => {
+  state.stats.scans += 1;
   const first = !state.initialized;
   const active = activeContact();
   const phone = active?.phone_e164 || state.activePhone;
+  state.stats.activePhone = phone;
+  state.stats.incomingNodes = document.querySelectorAll('#main .message-in, #main [data-testid="msg-container"].message-in').length;
+  state.stats.outgoingNodes = document.querySelectorAll('#main .message-out').length;
 
   if (phone) {
     const nodes = document.querySelectorAll(
@@ -166,15 +183,17 @@ const scan = () => {
     const rows = pane.querySelectorAll(
       '[data-testid="cell-frame-container"], [role="listitem"], [role="row"]'
     );
+    let matchedRows = 0;
     for (const row of rows) {
       if (!row.isConnected) continue;
       const contact = contactForLabel(rowLabel(row));
       if (!contact) continue;
+      matchedRows += 1;
       const unread = unreadPresent(row);
       const snapshot = norm(row.innerText || "") + "|" + norm(row.getAttribute("aria-label") || "") + "|" + unread;
       const previous = state.rowSnapshots.get(contact.phone_e164);
       state.rowSnapshots.set(contact.phone_e164, snapshot);
-      if (unread && ((first && emitInitialUnread) || (!first && previous !== snapshot))) {
+      if (unread && first && emitInitialUnread) {
         pushEvent({
           type: "unread_contact",
           phone: contact.phone_e164,
@@ -182,12 +201,25 @@ const scan = () => {
           snapshot,
           observed_at: Date.now()
         });
+      } else if (!first && previous !== undefined && previous !== snapshot) {
+        // A preview change also signals an incoming message on builds where
+        // WhatsApp no longer exposes a stable unread badge selector.
+        pushEvent({
+          type: unread ? "unread_contact" : "chat_changed",
+          phone: contact.phone_e164,
+          chat_name: contact.whatsapp_name,
+          snapshot,
+          observed_at: Date.now()
+        });
       }
     }
+    state.stats.matchedRows = matchedRows;
   }
   state.initialized = true;
 };
 const scheduleScan = () => {
+  state.stats.mutations += 1;
+  state.stats.lastMutationAt = Date.now();
   if (state.scheduled) return;
   state.scheduled = true;
   queueMicrotask(() => {
@@ -203,7 +235,14 @@ try {
     subtree: true, childList: true, characterData: true, attributes: true,
     attributeFilter: ["aria-label", "data-testid", "title", "class"]
   });
-  return {installed: true, mappedContacts: contacts.length};
+  return {
+    installed: true,
+    mappedContacts: contacts.length,
+    activePhone: state.stats.activePhone,
+    incomingNodes: state.stats.incomingNodes,
+    outgoingNodes: state.stats.outgoingNodes,
+    matchedRows: state.stats.matchedRows
+  };
 } catch (error) {
   return {installed: false, error: String(error)};
 }
