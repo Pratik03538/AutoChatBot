@@ -1,5 +1,6 @@
 """Open WhatsApp Web and print the first ten visible chat names."""
 
+import os
 from pathlib import Path
 
 from selenium import webdriver
@@ -27,7 +28,7 @@ CHAT_NAME_SELECTORS = (
 
 
 def start_chrome() -> webdriver.Chrome:
-    """Start Chrome with an app-specific profile stored beside this script."""
+    """Start Chrome with the app profile and avoid the known stale driver on PATH."""
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     options = Options()
@@ -35,7 +36,21 @@ def start_chrome() -> webdriver.Chrome:
     options.add_argument("--start-maximized")
     options.add_argument("--disable-notifications")
 
-    return webdriver.Chrome(options=options)
+    original_path = os.environ.get("PATH")
+    if original_path is not None:
+        stale_driver_dir = os.path.normcase(os.path.normpath(r"C:\chromedriver"))
+        filtered_entries = []
+        for entry in original_path.split(os.pathsep):
+            normalized = os.path.normcase(os.path.normpath(entry.strip('"')))
+            if normalized != stale_driver_dir:
+                filtered_entries.append(entry)
+        os.environ["PATH"] = os.pathsep.join(filtered_entries)
+
+    try:
+        return webdriver.Chrome(options=options)
+    finally:
+        if original_path is not None:
+            os.environ["PATH"] = original_path
 
 
 def wait_for_whatsapp_login(driver: webdriver.Chrome) -> None:

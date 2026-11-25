@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import sys
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -13,6 +14,7 @@ from urllib.request import Request, urlopen
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 MODEL = os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 HUMAN_REVIEW_REQUIRED = "__HUMAN_REVIEW_REQUIRED__"
 
 TONES = {
@@ -37,12 +39,26 @@ SYSTEM_PROMPT = (
 
 
 def get_api_key() -> str:
-    """Read the key from this process or request it without echoing it."""
+    """Read the key from the environment or local .env file."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key and ENV_FILE.is_file():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == "GROQ_API_KEY":
+                key = value.strip().strip('"').strip("'")
+                break
     if not key:
-        key = getpass.getpass("Groq API key (hidden input): ").strip()
+        key = getpass.getpass("Groq API key (.env is empty; hidden input): ").strip()
     if not key:
-        raise ValueError("API key nahi mili. Groq API key daal kar dobara run karein.")
+        raise ValueError(
+            "API key nahi mili. Project folder ki .env file mein "
+            "GROQ_API_KEY=your_key set karein."
+        )
     return key
 
 
