@@ -854,94 +854,103 @@ def _handle_new_messages(
         _write_state(contact["phone_e164"], state)
         return
 
-    timeline = list(history)
-    sent_context: list[dict[str, str]] = []
-    for current in pending:
+    # Several incoming messages may arrive before the next Groq call. They are
+    # context only: generate one draft for the newest incoming message, not one
+    # reply for every queued message.
+    current = pending[-1]
+    if len(pending) > 1:
         print(
-            f"[MESSAGE] Incoming from {contact['name']}: {current['text'][:300]}",
+            f"[CONTEXT] {len(pending) - 1} older incoming message(s) used only as reference; "
+            "replying to the latest message.",
             flush=True,
         )
-        current_index = next(
-            (index for index, message in enumerate(history) if message["id"] == current["id"]),
-            len(history),
-        )
-        prior_messages = history[:current_index] + sent_context
-        # The current incoming message is appended separately by make_draft,
-        # so reserve one of the 10 conversation slots for it.
-        prior_limit = max(0, min(history_limit, RECENT_CONTEXT_MESSAGES) - 1)
-        prompt_history = [
-            {"speaker": message["speaker"], "direction": message["direction"], "text": message["text"]}
-            for message in prior_messages
-        ][-prior_limit:] if prior_limit else []
+    timeline = list(history)
+    sent_context: list[dict[str, str]] = []
+    print(
+        f"[MESSAGE] Incoming from {contact['name']}: {current['text'][:300]}",
+        flush=True,
+    )
+    current_index = next(
+        (index for index, message in enumerate(history) if message["id"] == current["id"]),
+        len(history),
+    )
+    prior_messages = history[:current_index] + sent_context
+    # The current incoming message is appended separately by make_draft,
+    # so reserve one of the 10 conversation slots for it.
+    prior_limit = max(0, min(history_limit, RECENT_CONTEXT_MESSAGES) - 1)
+    prompt_history = [
+        {"speaker": message["speaker"], "direction": message["direction"], "text": message["text"]}
+        for message in prior_messages
+    ][-prior_limit:] if prior_limit else []
 
-        # The processed marker advances only after a draft/review/send outcome.
-        # A Groq failure leaves this incoming message recoverable.
-        draft = make_draft(
-            api_key=api_key,
-            message=current["text"],
-            context=_contact_context(contact),
-            tone=contact["tone"],
-            history=prompt_history,
-        )
+    # The processed marker advances only after a draft/review/send outcome.
+    # A Groq failure leaves this incoming message recoverable.
+    draft = make_draft(
+        api_key=api_key,
+        message=current["text"],
+        context=_contact_context(contact),
+        tone=contact["tone"],
+        history=prompt_history,
+    )
 
-        if draft == HUMAN_REVIEW_REQUIRED:
-            state["last_processed_id"] = current["id"]
-            state["history"] = history[-memory_limit:]
-            _write_state(contact["phone_e164"], state)
-            print(f"[REVIEW] {contact['name']}: sensitive/ambiguous message; human review needed.")
-            continue
-
-        if not contact["auto_send"] or dry_run:
-            mode = "DRY RUN" if dry_run else "DRAFT ONLY"
-            print(f"[{mode}] {contact['name']}: {draft}")
-            state["last_processed_id"] = current["id"]
-            state["history"] = history[-memory_limit:]
-            _write_state(contact["phone_e164"], state)
-            continue
-
-        # Journal the send intent before touching WhatsApp. If the process dies
-        # between Enter and the state commit, startup recovery will not blindly resend.
-        state["pending_send"] = {
-            "incoming_id": current["id"],
-            "draft": draft,
-            "started_at": time.time(),
-        }
+    if draft == HUMAN_REVIEW_REQUIRED:
+        state["last_processed_id"] = current["id"]
+        state["history"] = history[-memory_limit:]
         _write_state(contact["phone_e164"], state)
-        try:
-            _send_message(driver, draft)
-        except SendUncertain as error:
-            state["last_processed_id"] = current["id"]
-            state.pop("pending_send", None)
-            state["history"] = history[-memory_limit:]
-            _write_state(contact["phone_e164"], state)
-            print(f"[SEND CHECK] {contact['name']}: {error}")
-            continue
-        except RuntimeError:
-            # These errors occur before a send attempt (e.g. composer missing or
-            # an existing unsent draft); clear the journal so a safe retry can run.
-            state.pop("pending_send", None)
-            _write_state(contact["phone_e164"], state)
-            raise
+        print(f"[REVIEW] {contact['name']}: sensitive/ambiguous message; human review needed.")
+        continue
 
-        assistant_message = {
-            "id": hashlib.sha256(
-                f"auto-reply|{current['id']}|{draft}".encode("utf-8")
-            ).hexdigest(),
-            "speaker": "You",
-            "direction": "outgoing",
-            "text": " ".join(draft.split())[:MAX_MESSAGE_CHARS],
-        }
-        timeline_index = next(
-            (index for index, message in enumerate(timeline) if message["id"] == current["id"]),
-            len(timeline) - 1,
-        )
-        timeline.insert(timeline_index + 1, assistant_message)
-        sent_context.append(assistant_message)
+    if not contact["auto_send"] or dry_run:
+        mode = "DRY RUN" if dry_run else "DRAFT ONLY"
+        print(f"[{mode}] {contact['name']}: {draft}")
+        state["last_processed_id"] = current["id"]
+        state["history"] = history[-memory_limit:]
+        _write_state(contact["phone_e164"], state)
+        continue
+
+    # Journal the send intent before touching WhatsApp. If the process dies
+    # between Enter and the state commit, startup recovery will not blindly resend.
+    state["pending_send"] = {
+        "incoming_id": current["id"],
+        "draft": draft,
+        "started_at": time.time(),
+    }
+    _write_state(contact["phone_e164"], state)
+    try:
+        _send_message(driver, draft)
+    except SendUncertain as error:
         state["last_processed_id"] = current["id"]
         state.pop("pending_send", None)
-        state["history"] = timeline[-memory_limit:]
+        state["history"] = history[-memory_limit:]
         _write_state(contact["phone_e164"], state)
-        print(f"[SENT] {contact['name']}: reply sent and verified.")
+        print(f"[SEND CHECK] {contact['name']}: {error}")
+        continue
+    except RuntimeError:
+        # These errors occur before a send attempt (e.g. composer missing or
+        # an existing unsent draft); clear the journal so a safe retry can run.
+        state.pop("pending_send", None)
+        _write_state(contact["phone_e164"], state)
+        raise
+
+    assistant_message = {
+        "id": hashlib.sha256(
+            f"auto-reply|{current['id']}|{draft}".encode("utf-8")
+        ).hexdigest(),
+        "speaker": "You",
+        "direction": "outgoing",
+        "text": " ".join(draft.split())[:MAX_MESSAGE_CHARS],
+    }
+    timeline_index = next(
+        (index for index, message in enumerate(timeline) if message["id"] == current["id"]),
+        len(timeline) - 1,
+    )
+    timeline.insert(timeline_index + 1, assistant_message)
+    sent_context.append(assistant_message)
+    state["last_processed_id"] = current["id"]
+    state.pop("pending_send", None)
+    state["history"] = timeline[-memory_limit:]
+    _write_state(contact["phone_e164"], state)
+    print(f"[SENT] {contact['name']}: reply sent and verified.")
 
 
 def _baseline_contact(driver, contact: dict, history_limit: int, memory_limit: int) -> bool:
