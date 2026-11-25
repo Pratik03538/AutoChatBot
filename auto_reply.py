@@ -734,14 +734,29 @@ def _handle_new_messages(
             _write_state(contact["phone_e164"], state)
             continue
 
+        # Journal the send intent before touching WhatsApp. If the process dies
+        # between Enter and the state commit, startup recovery will not blindly resend.
+        state["pending_send"] = {
+            "incoming_id": current["id"],
+            "draft": draft,
+            "started_at": time.time(),
+        }
+        _write_state(contact["phone_e164"], state)
         try:
             _send_message(driver, draft)
         except SendUncertain as error:
             state["last_processed_id"] = current["id"]
+            state.pop("pending_send", None)
             state["history"] = history[-memory_limit:]
             _write_state(contact["phone_e164"], state)
             print(f"[SEND CHECK] {contact['name']}: {error}")
-            break
+            continue
+        except RuntimeError:
+            # These errors occur before a send attempt (e.g. composer missing or
+            # an existing unsent draft); clear the journal so a safe retry can run.
+            state.pop("pending_send", None)
+            _write_state(contact["phone_e164"], state)
+            raise
 
         assistant_message = {
             "id": hashlib.sha256(
@@ -754,6 +769,7 @@ def _handle_new_messages(
         timeline.append(assistant_message)
         sent_context.append(assistant_message)
         state["last_processed_id"] = current["id"]
+        state.pop("pending_send", None)
         state["history"] = timeline[-memory_limit:]
         _write_state(contact["phone_e164"], state)
         print(f"[SENT] {contact['name']}: reply sent and verified.")
@@ -775,6 +791,24 @@ def _baseline_contact(driver, contact: dict, history_limit: int, memory_limit: i
         _write_state(contact["phone_e164"], state)
         print(f"[BASELINE] {contact['name']}: existing chat captured; old messages won't trigger replies.")
         return False
+
+    pending_send = state.get("pending_send")
+    if isinstance(pending_send, dict):
+        incoming_id = pending_send.get("incoming_id")
+        draft = " ".join(str(pending_send.get("draft", "")).split()).strip()
+        outgoing_texts = {
+            " ".join(message["text"].split()).strip()
+            for message in live if message["direction"] == "outgoing"
+        }
+        state["last_processed_id"] = incoming_id or state.get("last_processed_id")
+        state.pop("pending_send", None)
+        if draft and draft in outgoing_texts:
+            print(f"[RECOVERY] {contact['name']}: send history mein mil gaya; duplicate resend roka.")
+        else:
+            print(
+                f"[RECOVERY CHECK] {contact['name']}: previous send outcome uncertain. "
+                "Chat manually verify karein; duplicate se bachne ke liye auto-resend nahi hoga."
+            )
 
     pending = _pending_messages(history, state)
     state["history"] = history
