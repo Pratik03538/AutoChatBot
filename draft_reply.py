@@ -144,7 +144,7 @@ def make_draft(
             {"role": "user", "content": user_content},
         ],
         "temperature": 0.65,
-        "max_tokens": 180,
+        "max_completion_tokens": 180,
     }
     request = Request(
         API_URL,
@@ -180,7 +180,7 @@ def make_draft(
 
         except HTTPError as error:
             detail = _error_detail(error.read().decode("utf-8", errors="replace"))
-            retryable = error.code == 429 or error.code in {408, 409, 425, 500, 502, 503, 504}
+            retryable = error.code in {408, 409, 425, 429, 498, 500, 502, 503, 504}
             last_error = GroqAPIError(
                 f"Groq API error ({error.code}): {detail}",
                 retryable=retryable,
