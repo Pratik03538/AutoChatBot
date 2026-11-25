@@ -95,8 +95,41 @@ const readText = element => {
   }
   return values.join("\n").slice(0, 700);
 };
+const messageDirection = element => {
+  if (element.closest(".message-in") || element.matches(".message-in")) return "incoming";
+  if (element.closest(".message-out") || element.matches(".message-out")) return "outgoing";
+
+  const hasMarker = selector => Boolean(
+    element.matches(selector) || element.querySelector(selector) || element.closest(selector)
+  );
+  if (hasMarker('[data-testid="tail-in"]')) return "incoming";
+  if (hasMarker('[data-testid="tail-out"]')) return "outgoing";
+
+  // Current WhatsApp Web builds place msg-container inside conv-msg-<id>
+  // and no longer expose .message-in/.message-out. Text is aligned to the
+  // sender's side of the conversation panel, so use its rendered position.
+  const textNode = element.querySelector('span.selectable-text, [data-testid="selectable-text"]');
+  const anchor = textNode || element;
+  const panel = document.querySelector('[data-testid="conversation-panel-messages"]') ||
+                document.querySelector("#main");
+  if (panel && anchor.getBoundingClientRect) {
+    const messageRect = anchor.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    if (messageRect.width > 0 && panelRect.width > 0) {
+      const messageCenter = messageRect.left + messageRect.width / 2;
+      const panelCenter = panelRect.left + panelRect.width / 2;
+      const deadZone = Math.min(24, panelRect.width * 0.025);
+      if (messageCenter < panelCenter - deadZone) return "incoming";
+      if (messageCenter > panelCenter + deadZone) return "outgoing";
+    }
+  }
+  return "unknown";
+};
 const messageIdentity = element => {
-  const holder = element.matches("[data-id]") ? element : element.querySelector("[data-id]");
+  const holder = element.closest('[data-testid^="conv-msg-"][data-id]') ||
+    (element.matches("[data-id]") ? element : null) ||
+    element.closest("[data-id]") ||
+    element.querySelector("[data-id]");
   const id = holder?.getAttribute("data-id");
   if (id) return id;
   return element.matches("[data-pre-plain-text]")
@@ -107,6 +140,13 @@ const activeContact = () => {
   const header = document.querySelector('#main header');
   if (header) {
     const titleCandidates = [
+      ...Array.from(
+        header.querySelectorAll(
+          '[data-testid="conversation-info-header-chat-title-name"], ' +
+          '[data-testid="conversation-info-header-chat-title"]'
+        ),
+        n => n.getAttribute('title') || n.innerText || n.textContent || ''
+      ),
       ...Array.from(header.querySelectorAll('[title]'), n => n.getAttribute('title') || ''),
       ...Array.from(header.querySelectorAll('[aria-label]'), n => n.getAttribute('aria-label') || '')
     ];
@@ -135,7 +175,10 @@ const unreadPresent = row => {
 };
 const rowLabel = row => {
   const candidates = [
-    ...Array.from(row.querySelectorAll('[data-testid="cell-frame-title"][title]'), n => n.getAttribute('title') || ''),
+    ...Array.from(
+      row.querySelectorAll('[data-testid="cell-frame-title"]'),
+      n => n.getAttribute('title') || n.innerText || n.textContent || ''
+    ),
     ...Array.from(row.querySelectorAll('span[title], [title]'), n => n.getAttribute('title') || ''),
     ...Array.from(row.querySelectorAll('[aria-label]'), n => n.getAttribute('aria-label') || '')
   ];
@@ -151,22 +194,34 @@ const scan = () => {
   const active = activeContact();
   const phone = active?.phone_e164 || state.activePhone;
   state.stats.activePhone = phone;
-  state.stats.incomingNodes = document.querySelectorAll('#main .message-in, #main [data-testid="msg-container"].message-in').length;
-  state.stats.outgoingNodes = document.querySelectorAll('#main .message-out').length;
+  const nodes = document.querySelectorAll(
+    '#main [data-testid="msg-container"], #main .message-in, #main .message-out'
+  );
+  const directions = new Map();
+  let incomingCount = 0;
+  let outgoingCount = 0;
+  let unknownCount = 0;
+  for (const node of nodes) {
+    const direction = messageDirection(node);
+    directions.set(node, direction);
+    if (direction === "incoming") incomingCount += 1;
+    else if (direction === "outgoing") outgoingCount += 1;
+    else unknownCount += 1;
+  }
+  state.stats.incomingNodes = incomingCount;
+  state.stats.outgoingNodes = outgoingCount;
+  state.stats.unknownDirectionNodes = unknownCount;
 
   if (phone) {
-    const nodes = document.querySelectorAll(
-      '#main [data-testid="msg-container"], #main .message-in, #main .message-out'
-    );
     for (const node of nodes) {
-      const incoming = Boolean(node.closest(".message-in") || node.classList.contains("message-in"));
-      const outgoing = Boolean(node.closest(".message-out") || node.classList.contains("message-out"));
-      if (!incoming && !outgoing) continue;
+      const direction = directions.get(node);
+      if (direction !== "incoming" && direction !== "outgoing") continue;
+      const incoming = direction === "incoming";
       const text = readText(node);
       if (!text) continue;
       const rawId = messageIdentity(node);
       const id = rawId || ((incoming ? "in:" : "out:") + text);
-      const unique = phone + "|" + id + "|" + (incoming ? "in" : "out");
+      const unique = phone + "|" + id + "|" + direction;
       if (first) {
         state.seenMessages.add(unique);
       } else if (incoming && !state.seenMessages.has(unique)) {
@@ -229,17 +284,7 @@ const scheduleScan = records => {
     }
     return false;
   });
-  const now = Date.now();
-  if (relevant && state.activePhone && now - (state.stats.lastWakeAt || 0) >= 350) {
-    state.stats.lastWakeAt = now;
-    pushEvent({
-      type: "dom_changed",
-      phone: state.activePhone,
-      snapshot: String(Math.floor(now / 350)),
-      observed_at: now
-    });
-  }
-  if (state.scheduled) return;
+  if (!relevant || state.scheduled) return;
   state.scheduled = true;
   queueMicrotask(() => {
     state.scheduled = false;
@@ -443,8 +488,9 @@ def _observer_status(driver) -> dict:
           activePhone: state?.stats?.activePhone || state?.activePhone || null,
           scans: state?.stats?.scans || 0,
           mutations: state?.stats?.mutations || 0,
-          incomingNodes: main?.querySelectorAll('.message-in').length || 0,
-          outgoingNodes: main?.querySelectorAll('.message-out').length || 0,
+          incomingNodes: state?.stats?.incomingNodes || 0,
+          outgoingNodes: state?.stats?.outgoingNodes || 0,
+          unknownDirectionNodes: state?.stats?.unknownDirectionNodes || 0,
           messageContainers: main?.querySelectorAll('[data-testid="msg-container"]').length || 0,
           paneRows: document.querySelectorAll('#pane-side [data-testid="cell-frame-container"]').length || 0,
           matchedRows: state?.stats?.matchedRows || 0,
@@ -474,24 +520,83 @@ def wait_for_dom_events(driver, timeout_seconds: float = OBSERVER_WAIT_SECONDS) 
         ) from error
 
 
+def _classify_message_direction(
+    incoming_marker: bool,
+    outgoing_marker: bool,
+    message_left: float | None,
+    message_right: float | None,
+    panel_left: float | None,
+    panel_right: float | None,
+) -> str:
+    """Classify a WhatsApp bubble by stable direction markers, then visual alignment."""
+    if incoming_marker and not outgoing_marker:
+        return "incoming"
+    if outgoing_marker and not incoming_marker:
+        return "outgoing"
+    if incoming_marker or outgoing_marker:
+        return "unknown"
+    values = (message_left, message_right, panel_left, panel_right)
+    if any(value is None for value in values):
+        return "unknown"
+    panel_width = float(panel_right) - float(panel_left)
+    message_width = float(message_right) - float(message_left)
+    if panel_width <= 0 or message_width <= 0:
+        return "unknown"
+    message_center = (float(message_left) + float(message_right)) / 2
+    panel_center = (float(panel_left) + float(panel_right)) / 2
+    dead_zone = min(24.0, panel_width * 0.025)
+    if message_center < panel_center - dead_zone:
+        return "incoming"
+    if message_center > panel_center + dead_zone:
+        return "outgoing"
+    return "unknown"
+
+
 def _message_direction(driver, element) -> str:
     try:
-        return driver.execute_script(
+        geometry = driver.execute_script(
             """
             const node = arguments[0];
-            if (node.closest('.message-in') || node.matches('.message-in') || node.querySelector('.message-in')) return 'incoming';
-            if (node.closest('.message-out') || node.matches('.message-out') || node.querySelector('.message-out')) return 'outgoing';
-            const marker = node.getAttribute('data-testid') || '';
-            if (marker === 'msg-container') {
-              const parent = node.parentElement;
-              if (parent?.closest('.message-in')) return 'incoming';
-              if (parent?.closest('.message-out')) return 'outgoing';
+            const hasMarker = selector => Boolean(
+              node.matches(selector) || node.querySelector(selector) || node.closest(selector)
+            );
+            if (node.closest('.message-in') || node.matches('.message-in')) {
+              return {incomingMarker: true, outgoingMarker: false};
             }
-            return 'unknown';
+            if (node.closest('.message-out') || node.matches('.message-out')) {
+              return {incomingMarker: false, outgoingMarker: true};
+            }
+            const content = node.querySelector(
+              'span.selectable-text, [data-testid="selectable-text"]'
+            );
+            const anchor = content || node;
+            const panel = document.querySelector(
+              '[data-testid="conversation-panel-messages"]'
+            ) || document.querySelector('#main');
+            const messageRect = anchor.getBoundingClientRect();
+            const panelRect = panel ? panel.getBoundingClientRect() : null;
+            return {
+              incomingMarker: hasMarker('[data-testid="tail-in"]'),
+              outgoingMarker: hasMarker('[data-testid="tail-out"]'),
+              messageLeft: messageRect.left,
+              messageRight: messageRect.right,
+              panelLeft: panelRect ? panelRect.left : null,
+              panelRight: panelRect ? panelRect.right : null
+            };
             """,
             element,
         )
-    except WebDriverException:
+        if not isinstance(geometry, dict):
+            return "unknown"
+        return _classify_message_direction(
+            bool(geometry.get("incomingMarker")),
+            bool(geometry.get("outgoingMarker")),
+            geometry.get("messageLeft"),
+            geometry.get("messageRight"),
+            geometry.get("panelLeft"),
+            geometry.get("panelRight"),
+        )
+    except (TypeError, ValueError, WebDriverException):
         return "unknown"
 
 
@@ -515,7 +620,9 @@ def _message_identity(driver, element, direction: str, text: str) -> str:
         stable_id = driver.execute_script(
             """
             const node = arguments[0];
-            const holder = node.matches('[data-id]') ? node : node.querySelector('[data-id]');
+            const holder = node.closest('[data-testid^="conv-msg-"][data-id]') ||
+              (node.matches('[data-id]') ? node : null) ||
+              node.closest('[data-id]') || node.querySelector('[data-id]');
             let meta = '';
             if (node.matches('[data-pre-plain-text]')) {
               meta = node.getAttribute('data-pre-plain-text') || '';
@@ -1049,16 +1156,11 @@ def main() -> None:
                             f"{contact['name'] if contact else phone} | type={event_type}",
                             flush=True,
                         )
-                    elif event_type == "dom_changed":
-                        print(
-                            f"[EVENT] Chat DOM changed | {contact['name'] if contact else phone}",
-                            flush=True,
-                        )
                 event_phones = {
                     str(event.get("phone"))
                     for event in events
                     if event.get("type") in {
-                        "incoming", "unread_contact", "chat_changed", "dom_changed"
+                        "incoming", "unread_contact", "chat_changed"
                     }
                     and str(event.get("phone")) in contacts_by_phone
                 }
