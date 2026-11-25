@@ -1,71 +1,163 @@
 # AutoChatBot
 
-A Windows Python project with WhatsApp tools:
+Windows Python project for event-driven WhatsApp Web monitoring and Groq-assisted replies.
 
-- `main.py` opens WhatsApp Web in Chrome using a dedicated local profile and prints up to 10 visible chat names.
-- `auto_reply.py` watches only phone numbers listed in local `contacts.json`, uses recent chat context to create replies, and automatically sends them when that contact has `auto_send: true`.
-- `draft_reply.py` remains available for manual, paste-a-message reply drafts.
+## What it does
+
+- Opens WhatsApp Web in Chrome using a dedicated persistent local profile at `chrome_profile/`.
+- Uses Selenium to install a browser-side JavaScript `MutationObserver`. The observer watches the active conversation for incoming text messages and the chat list for unread changes to explicitly configured contacts.
+- Wakes Python through an asynchronous browser event queue. It does not wait for a fixed 12-second polling interval.
+- Matches inactive chats by their exact WhatsApp display title (`whatsapp_name`), then opens only the configured phone number.
+- Reads up to the newest 15 previous text messages already rendered in the active chat as reference only. It does not scroll through older history or load the full conversation.
+- Sends up to 15 previous messages as context, then appends the newest incoming message separately as the only reply target. Groq receives a role-preserving `messages` array (`user` / `assistant`).
+- Persists at most 15 recent message records locally per contact for context and message-state recovery. When several messages arrive before one processing pass, only the newest is replied to; older pending messages are reference context.
+- Uses a safe dry-run default. Real sending requires both global `dry_run: false` and that contact's `auto_send: true`.
+
+## Important latency and reliability limits
+
+This is event-driven browser automation, not a zero-latency messaging transport. The observer reacts as soon as WhatsApp Web renders a DOM change, but actual response time still includes WhatsApp delivery/rendering, Selenium/browser scheduling, Groq inference, internet latency and WhatsApp sending. No script can guarantee zero seconds or error-free delivery.
+
+WhatsApp Web is not a documented automation interface. Its HTML selectors and unread indicators may change. If the chat title or unread marker cannot be identified, the bot fails closed rather than sending to an unverified contact. For dependable production-grade real-time messaging, use the official WhatsApp Business Platform and its webhooks where eligible.
 
 ## Requirements
 
+- Windows 10/11
 - Python 3.10 or newer
 - Google Chrome installed
 - Internet access
-- A Groq API key for AI replies
+- Groq API key
 
-Install dependencies in the project virtual environment:
+Install from PyCharm terminal:
 
 ```cmd
-cd /d C:\Users\Pratik\PycharmProjects\AutoChatBot
-venv\Scripts\activate
-python -m pip install -r requirements.txt
+py -3 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-## Automatic replies
+Selenium 4 uses Selenium Manager to locate/download a compatible ChromeDriver. Close other Chrome processes using this project's `chrome_profile` before starting the bot.
 
-The project folder contains a local `contacts.json` with the testing number supplied by the owner. That file is ignored by Git and is not pushed to GitHub. Add future numbers as objects in its `contacts` list. For each number, set `enabled` and `auto_send` to `true` only when you want it monitored and allowed to send.
+## First-time configuration
 
-A 10-digit local number uses the configured `country_code` (currently `91`). A full international number can be entered with a leading plus and country code. You can edit `name`, `relationship`, `tone`, and `memory_notes` for each contact. Keep private details in `contacts.json`; the tracked `contacts.example.json` is only a format example.
+1. Copy `contacts.example.json` to `contacts.json` in the project root.
+2. Add your own WhatsApp number and change `whatsapp_name` to the exact title shown in the WhatsApp Web chat list.
+3. Set `enabled: true` for a contact you want monitored.
+4. Keep `auto_send: false` and global `dry_run: true` for the first test.
+5. Copy `.env.example` to `.env`, then set `GROQ_API_KEY`.
 
-## Add the private API key
+Example contact configuration:
 
-The local `.env` file is excluded from Git. Open it and put the Groq key on the second line:
-
-```text
-GROQ_API_KEY=your_groq_api_key
+```json
+{
+  "country_code": "91",
+  "dry_run": true,
+  "history_messages": 15,
+  "memory_messages": 15,
+  "contacts": [
+    {
+      "phone": "9876543210",
+      "name": "Local label for this contact",
+      "whatsapp_name": "Exact saved name shown in WhatsApp",
+      "relationship": "friend",
+      "tone": "casual, natural and understated",
+      "memory_notes": "",
+      "enabled": true,
+      "auto_send": false
+    }
+  ]
+}
 ```
 
-Create a key at the [Groq Console](https://console.groq.com/keys). Do not share the key or commit `.env`. The tracked `.env.example` has the same format but contains no key.
+The example number is a placeholder. Replace it before enabling a contact. A 10-digit local number uses `country_code`; a full international number may start with `+`. Configuration flags must be JSON booleans (`true`/`false`), not quoted strings such as `"false"`.
 
 ## Run from PyCharm
 
-1. Open the existing `AutoChatBot` folder in PyCharm and select its `venv` interpreter.
-2. Open `auto_reply.py` and click **Run**.
-3. Chrome opens WhatsApp Web using the persistent `chrome_profile/`. Scan the QR code if asked; after login the bot starts monitoring contacts from `contacts.json`.
-4. Stop the run in PyCharm when you want the auto-reply session to end.
+- Select the project's `.venv` interpreter.
+- Run `auto_reply.py`.
+- On first launch, Chrome opens WhatsApp Web. Scan the QR code if requested.
+- The script visits each configured chat once to create a safe baseline. Messages already present at baseline are not auto-replied to.
+- Once the `[READY]` message appears, the MutationObserver monitors new incoming messages and unread chat-list changes.
+- Stop the run with Ctrl+C or the PyCharm stop control.
 
-The script filters the known stale `C:\chromedriver` entry while starting Selenium, so it can use the driver matching Chrome when launched from PyCharm too. The CMD launcher is also available by running `run_auto_reply.cmd`.
+### Terminal diagnostics
 
-On first launch for each contact, the latest incoming message is saved as a baseline; it is used for context but does not trigger an automatic reply. Later, only newly received text messages from configured contacts are considered. The bot polls every 12 seconds by default, can respond to multiple newly received messages in order, and will not reply to its own outgoing messages.
+A healthy run prints an observer-install line and then an `[WAIT] Alive` status approximately every 15 seconds when idle. When WhatsApp mutates the active chat or a configured chat-list row, it prints an `[EVENT]` line. Newly extracted incoming text appears as `[MESSAGE]`; draft-only mode prints the Groq reply as `[DRY RUN]`.
 
-For context, it loads up to `memory_messages` recent WhatsApp text messages and keeps that bounded history per contact in local `chat_data/` across restarts. Each AI request receives only the newest `history_messages` messages, the new incoming message, and that contact's `memory_notes`. Media-only messages are ignored. You can change these limits and add persistent style details such as preferred names or inside jokes in `contacts.json`.
+Check these diagnostic fields:
+- `incoming_nodes`: visible WhatsApp incoming message containers in the active chat.
+- `message_containers`: visible message wrappers recognised by the current selector.
+- `mutations`: how many WhatsApp DOM mutation callbacks the observer has seen.
+- `matched_rows`: configured contact rows successfully matched in the chat list.
 
-The recent messages and notes sent for each reply go to Groq. Message history is also saved locally in `chat_data/` so the bot can remember context across restarts; both `chat_data/` and `contacts.json` are excluded from Git. Groq says inference data is not retained by default, but it may temporarily log data for reliability or abuse checks for up to 30 days; see [Groq data controls](https://console.groq.com/docs/your-data). Avoid including sensitive information in style notes or chat messages.
+If `mutations=0`, check that WhatsApp Web is fully loaded and the observer is still installed. If mutations increase but `incoming_nodes=0`, the WhatsApp Web message selectors likely need updating. If incoming nodes are present but no `[MESSAGE]` appears, check the saved message marker in local `chat_data/`; don't delete that state because it protects against duplicates.
 
-AI cannot guarantee a perfect reply. If it detects a safety issue, medical/legal/financial decision, serious conflict, or too much ambiguity, it skips automatic sending and prints a human-review notice. Replies are designed to be short, warm, and informed by the recent chat, but adjust each contact's notes if the tone needs tuning.
-
-Groq advertises about 1,000 generated tokens per second for `openai/gpt-oss-20b`; the actual response time depends on network and service load. Free-tier limits vary by account and model. Check the [Groq rate limits page](https://console.groq.com/docs/rate-limits) and the Limits page in your Console; there is no fixed message-count guarantee. WhatsApp Web's layout may change and require selector updates.
-
-## Manual draft mode
-
-To generate one reply from text you paste manually, run:
+You may also run:
 
 ```cmd
-python draft_reply.py
+.venv\Scripts\python.exe auto_reply.py
 ```
 
-This command does not access WhatsApp or send messages.
+Or double-click `run_auto_reply.cmd`; it prefers `.venv`, supports the older `venv` folder, and falls back to the system `python` command.
 
-## Privacy
+## Enabling real automatic sending
 
-`chrome_profile/` contains WhatsApp session data and cookies, `contacts.json` contains phone numbers and preferences, `.env` contains the API key, and `chat_data/` contains recent message memory and reply-tracking state. These remain local and are ignored by `.gitignore`. Do not commit or share them.
+The repository template stays safe by default (`dry_run: true`, `auto_send: false`). After reviewing generated drafts and confirming the exact chat mapping and the recipient's agreement, use the guarded local switch:
+
+```cmd
+.\venv\Scripts\python.exe enable_live_autoreply.py --contact-name "Testing number" --enable-live
+```
+
+Replace `Testing number` with the exact `name` value in your local `contacts.json`. The command:
+- Requires exactly one enabled contact and an exact name match. It refuses to enable live sending if multiple contacts are enabled.
+- Sets global `dry_run: false` and `auto_send: true` only for that contact. It also sets the tone to casual, natural and understated.
+- Creates a timestamped backup of the previous `contacts.json` before changing it. These backups are ignored by Git.
+
+To turn live sending off immediately:
+
+```cmd
+.\venv\Scripts\python.exe enable_live_autoreply.py --disable-live
+```
+
+That command restores `dry_run: true` and sets `auto_send: false` for every contact. Restart the bot after either change because settings are loaded at startup.
+
+The program only monitors contacts in the local `contacts.json`. Enable automatic replies only for recipients who explicitly agreed to receive them. Keep replies personal, relevant and low volume; do not use this tool for bulk messaging or unsolicited outreach.
+
+## Groq and privacy
+
+The local `.env` file contains the private API key. Up to 15 previous conversation messages are sent to Groq as reference, followed by the newest incoming message as the only reply target, plus configured style notes. The bot does not scroll backward or load the full conversation. Up to 15 recent message records, phone numbers, session cookies and processing state remain in local files excluded from Git. Avoid putting sensitive personal information in chat notes or sending sensitive conversations to an external model.
+
+The reply prompt asks Groq to match the incoming message's language and use history only as context. It enforces a neutral, non-romantic style and rejects drafts containing common pet names, romantic phrases or romantic emojis; sensitive/ambiguous medical, legal, financial, safety or serious-conflict messages are deferred to a human. These checks reduce risk but cannot guarantee a correct reply. Review real-send behavior carefully.
+
+## Failure handling
+
+- Uses the official Groq Python SDK for GPT-OSS 20B with low reasoning effort, reasoning hidden from the text response, and a 1,024-token completion budget. Empty completions include finish-reason diagnostics.
+- Transient network, timeout, rate-limit and server errors receive bounded retries with SDK retries disabled to avoid retry multiplication.
+- Non-retryable Groq errors (including HTTP 403) pause provider calls for that contact until the bot is restarted after the provider issue is resolved. The incoming-message marker remains unadvanced so the message is not silently discarded.
+- Authentication/configuration errors are reported without marking the incoming message as processed.
+- If WhatsApp send confirmation is uncertain, the message is not automatically resent; manually inspect the chat to avoid duplicates.
+- If the saved history marker is no longer present in the visible history, the bot skips that uncertain backlog rather than risk replying twice.
+- If WhatsApp changes its DOM selectors or unread indicators, the bot may need a selector update. It does not bypass QR login, CAPTCHA or MFA.
+
+## Tests
+
+Run the standard-library test suite:
+
+```cmd
+python -m unittest discover -s tests -v
+```
+
+The tests validate phone/config parsing, guarded live-mode configuration and backups, latest-pending-only reply behavior, stable message identity across WhatsApp DOM re-renders, neutral Roman Hindi/Hinglish style enforcement, Groq GPT-OSS token/reasoning settings, non-retryable Groq 403 handling, and the 15-message no-scroll reference reader plus role-preserving request array. They do not replace a live WhatsApp Web or live Groq API test.
+
+## Other modes
+
+`main.py` opens WhatsApp Web and lists visible chat names. `draft_reply.py` generates a manual reply from text pasted into the terminal; it does not open WhatsApp or send messages.
+
+## Local files that must stay private
+
+- `chrome_profile/`: WhatsApp session cookies and authentication data
+- `.env`: Groq API key
+- `contacts.json`: phone numbers and contact preferences
+- `chat_data/`: recent chat history and message-processing markers
+
+These paths are excluded by `.gitignore`. Never commit or share them.

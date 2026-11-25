@@ -1,14 +1,15 @@
 {
   "country_code": "91",
-  "poll_seconds": 12,
-  "history_messages": 25,
-  "memory_messages": 120,
+  "dry_run": true,
+  "history_messages": 15,
+  "memory_messages": 15,
   "contacts": [
     {
       "phone": "9876543210",
       "name": "Example contact",
-      "relationship": "partner",
-      "tone": "romantic and sweet",
+      "whatsapp_name": "Exact WhatsApp chat title",
+      "relationship": "friend",
+      "tone": "casual, natural and understated",
       "memory_notes": "Optional: preferred name, shared context, boundaries, or inside jokes.",
       "enabled": false,
       "auto_send": false
