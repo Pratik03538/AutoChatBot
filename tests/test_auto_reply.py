@@ -99,6 +99,14 @@ class MessageStateTests(unittest.TestCase):
             ["new-in"],
         )
 
+    def test_missing_marker_is_skipped_once_then_baseline_recovers(self):
+        history = [
+            {"id": "newest", "direction": "incoming", "text": "arrived after long idle"},
+        ]
+        state = {"last_processed_id": "older-marker-no-longer-visible"}
+        self.assertEqual(auto_reply._pending_messages(history, state), [])
+        self.assertEqual(state["last_processed_id"], "newest")
+
     def test_memory_merge_keeps_previously_saved_context(self):
         saved = [
             {"id": "a", "direction": "incoming", "text": "one"},
