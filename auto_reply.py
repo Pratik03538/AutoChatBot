@@ -766,7 +766,11 @@ def _handle_new_messages(
             "direction": "outgoing",
             "text": " ".join(draft.split())[:MAX_MESSAGE_CHARS],
         }
-        timeline.append(assistant_message)
+        timeline_index = next(
+            (index for index, message in enumerate(timeline) if message["id"] == current["id"]),
+            len(timeline) - 1,
+        )
+        timeline.insert(timeline_index + 1, assistant_message)
         sent_context.append(assistant_message)
         state["last_processed_id"] = current["id"]
         state.pop("pending_send", None)
