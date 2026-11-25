@@ -84,6 +84,44 @@ class ConfigTests(unittest.TestCase):
                     auto_reply.load_config()
 
 
+class DirectionClassificationTests(unittest.TestCase):
+    def test_explicit_tail_markers_take_precedence(self):
+        self.assertEqual(
+            auto_reply._classify_message_direction(True, False, None, None, None, None),
+            "incoming",
+        )
+        self.assertEqual(
+            auto_reply._classify_message_direction(False, True, None, None, None, None),
+            "outgoing",
+        )
+
+    def test_conflicting_markers_are_not_guessed(self):
+        self.assertEqual(
+            auto_reply._classify_message_direction(True, True, 10, 20, 0, 100),
+            "unknown",
+        )
+
+    def test_left_and_right_alignment_fallback(self):
+        self.assertEqual(
+            auto_reply._classify_message_direction(False, False, 100, 220, 0, 1000),
+            "incoming",
+        )
+        self.assertEqual(
+            auto_reply._classify_message_direction(False, False, 780, 900, 0, 1000),
+            "outgoing",
+        )
+
+    def test_center_dead_zone_and_missing_geometry_are_unknown(self):
+        self.assertEqual(
+            auto_reply._classify_message_direction(False, False, 450, 550, 0, 1000),
+            "unknown",
+        )
+        self.assertEqual(
+            auto_reply._classify_message_direction(False, False, None, None, 0, 1000),
+            "unknown",
+        )
+
+
 class MessageStateTests(unittest.TestCase):
     def test_pending_messages_are_only_incoming_after_saved_marker(self):
         history = [
