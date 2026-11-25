@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import URLError
+from types import SimpleNamespace
 
 import auto_reply
 import draft_reply
@@ -159,44 +159,94 @@ class MessageStateTests(unittest.TestCase):
 
 
 class GroqRetryTests(unittest.TestCase):
-    class FakeResponse:
+    class FakeClient:
+        def __init__(self, create):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=create)
+            )
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return False
 
-        def read(self):
-            return json.dumps({
-                "choices": [{"message": {"content": "Haan, bilkul. Main dekh leti hoon."}}]
-            }).encode("utf-8")
+    @staticmethod
+    def _completion(text):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+        )
 
     def test_network_failure_retries_once_and_returns_reply(self):
         calls = {"count": 0}
+        options = {}
 
-        def fake_urlopen(_request, timeout):
-            self.assertEqual(timeout, draft_reply.REQUEST_TIMEOUT_SECONDS)
+        class FakeConnectionError(Exception):
+            pass
+
+        def fake_create(**kwargs):
+            self.assertEqual(kwargs["model"], draft_reply.MODEL)
+            self.assertEqual(kwargs["max_completion_tokens"], 180)
             calls["count"] += 1
             if calls["count"] == 1:
-                raise URLError("temporary network problem")
-            return self.FakeResponse()
+                raise FakeConnectionError("temporary network problem")
+            return self._completion("Haan, bilkul. Main dekh leti hoon.")
 
-        with patch.object(draft_reply, "urlopen", side_effect=fake_urlopen):
-            with patch.object(draft_reply.time, "sleep"):
-                result = draft_reply.make_draft(
-                    "test-key",
-                    "Can you check this?",
-                    "Relationship: friend",
-                    "warm",
-                )
+        def fake_groq(**kwargs):
+            options.update(kwargs)
+            return self.FakeClient(fake_create)
+
+        with patch.object(draft_reply, "Groq", side_effect=fake_groq):
+            with patch.object(draft_reply, "APIConnectionError", FakeConnectionError):
+                with patch.object(draft_reply.time, "sleep"):
+                    result = draft_reply.make_draft(
+                        "test-key",
+                        "Can you check this?",
+                        "Relationship: friend",
+                        "warm",
+                    )
 
         self.assertEqual(result, "Haan, bilkul. Main dekh leti hoon.")
         self.assertEqual(calls["count"], 2)
+        self.assertEqual(options["max_retries"], 0)
+        self.assertEqual(options["timeout"], draft_reply.REQUEST_TIMEOUT_SECONDS)
+
+    def test_cloudflare_403_is_not_retried(self):
+        calls = {"count": 0}
+
+        class FakeResponse:
+            text = json.dumps({
+                "error_code": 1010,
+                "error_name": "browser_signature_banned",
+                "detail": "Access denied",
+            })
+            headers = {}
+
+        class FakeStatusError(Exception):
+            status_code = 403
+            response = FakeResponse()
+
+        def fake_create(**_kwargs):
+            calls["count"] += 1
+            raise FakeStatusError("403 access denied")
+
+        with patch.object(draft_reply, "Groq", return_value=self.FakeClient(fake_create)):
+            with patch.object(draft_reply, "APIStatusError", FakeStatusError):
+                with self.assertRaises(draft_reply.GroqAPIError) as caught:
+                    draft_reply.make_draft(
+                        "test-key", "Hello", "Relationship: friend", "warm"
+                    )
+
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(calls["count"], 1)
 
     def test_empty_input_is_rejected_without_network(self):
-        with self.assertRaises(draft_reply.GroqAPIError) as caught:
-            draft_reply.make_draft("test-key", "   ", "", "warm")
+        with patch.object(draft_reply, "Groq") as groq_client:
+            with self.assertRaises(draft_reply.GroqAPIError) as caught:
+                draft_reply.make_draft("test-key", "   ", "", "warm")
         self.assertFalse(caught.exception.retryable)
+        groq_client.assert_not_called()
 
 
 if __name__ == "__main__":
