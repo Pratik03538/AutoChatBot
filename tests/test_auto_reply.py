@@ -48,8 +48,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(contacts), 1)
         self.assertFalse(contacts[0]["auto_send"])
         self.assertEqual(contacts[0]["whatsapp_name"], "Exact WhatsApp title")
-        self.assertGreaterEqual(history_limit, 5)
-        self.assertGreaterEqual(memory_limit, 20)
+        self.assertEqual(history_limit, 10)
+        self.assertEqual(memory_limit, 10)
 
     def test_string_boolean_is_rejected(self):
         payload = {
@@ -82,6 +82,71 @@ class ConfigTests(unittest.TestCase):
             with patch.object(auto_reply, "CONFIG_FILE", path):
                 with self.assertRaisesRegex(ValueError, "Duplicate"):
                     auto_reply.load_config()
+
+
+class RecentHistoryTests(unittest.TestCase):
+    def test_reads_only_latest_ten_without_scrolling(self):
+        visible = [
+            {"id": str(index), "direction": "incoming", "text": f"message-{index}"}
+            for index in range(15)
+        ]
+        with patch.object(auto_reply, "extract_visible_messages", return_value=visible):
+            with patch.object(
+                auto_reply,
+                "_find_message_scroller",
+                side_effect=AssertionError("history reader must not scroll"),
+            ) as scroll:
+                result = auto_reply.read_recent_history(object(), 10)
+
+        self.assertEqual([item["id"] for item in result], [str(i) for i in range(5, 15)])
+        self.assertEqual(len(result), 10)
+        scroll.assert_not_called()
+
+    def test_respects_smaller_configured_limit(self):
+        visible = [{"id": str(index), "text": str(index)} for index in range(10)]
+        with patch.object(auto_reply, "extract_visible_messages", return_value=visible):
+            result = auto_reply.read_recent_history(object(), 4)
+        self.assertEqual([item["id"] for item in result], ["6", "7", "8", "9"])
+
+
+class RecentMessageArrayTests(unittest.TestCase):
+    def test_array_contains_only_nine_prior_messages_plus_latest(self):
+        history = [
+            {
+                "speaker": "Contact" if index % 2 == 0 else "You",
+                "direction": "incoming" if index % 2 == 0 else "outgoing",
+                "text": f"history-{index}",
+            }
+            for index in range(15)
+        ]
+        messages = draft_reply._build_chat_messages(
+            message="latest incoming",
+            context="Relationship: friend",
+            tone="warm",
+            history=history,
+        )
+
+        conversation = messages[2:]
+        self.assertEqual(len(conversation), 10)
+        self.assertEqual(
+            [item["content"] for item in conversation[:-1]],
+            [f"history-{index}" for index in range(6, 15)],
+        )
+        self.assertEqual(conversation[-1], {
+            "role": "user",
+            "content": "Latest incoming WhatsApp message (reply to this only):\\nlatest incoming",
+        })
+        self.assertEqual(
+            [item["role"] for item in conversation[:-1]],
+            ["user", "assistant"] * 4 + ["user"],
+        )
+
+    def test_empty_history_still_sends_latest_message(self):
+        messages = draft_reply._build_chat_messages(
+            message="hello", context="", tone="warm", history=[]
+        )
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[-1]["role"], "user")
 
 
 class DirectionClassificationTests(unittest.TestCase):
