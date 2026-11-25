@@ -85,6 +85,8 @@ You may also run:
 .venv\Scripts\python.exe auto_reply.py
 ```
 
+Or double-click `run_auto_reply.cmd`; it prefers `.venv`, supports the older `venv` folder, and falls back to the system `python` command.
+
 ## Enabling real automatic sending
 
 Only after testing drafts and confirming the exact contact mapping:
