@@ -1,4 +1,10 @@
-"""Auto-reply to newly received messages from explicitly configured contacts."""
+"""Event-driven WhatsApp Web auto-replies for explicitly configured contacts.
+
+The browser-side MutationObserver detects message and unread-list DOM changes.
+Selenium waits on an asynchronous browser-side event queue instead of polling
+WhatsApp every N seconds. This remains dependent on WhatsApp Web's DOM and
+network delivery; it cannot provide a hard real-time or zero-latency guarantee.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +13,14 @@ import json
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
-from draft_reply import HUMAN_REVIEW_REQUIRED, get_api_key, make_draft
+from draft_reply import GroqAPIError, HUMAN_REVIEW_REQUIRED, get_api_key, make_draft
 from main import start_chrome, wait_for_whatsapp_login
 
 
@@ -30,18 +37,222 @@ COMPOSER_SELECTORS = (
     '#main footer [contenteditable="true"]',
 )
 MAX_MESSAGE_CHARS = 700
+OBSERVER_WAIT_SECONDS = 15
 
+# This code runs in WhatsApp Web. It only observes the active conversation and
+# configured chat-list rows; it does not click, send, or alter page content.
+OBSERVER_INSTALL_SCRIPT = r"""
+const contacts = arguments[0] || [];
+const activePhone = arguments[1] || null;
+const emitInitialUnread = Boolean(arguments[2]);
+
+if (window.__autochatObserver?.observer) {
+  window.__autochatObserver.observer.disconnect();
+}
+const state = {
+  contacts,
+  activePhone,
+  events: [],
+  waiters: [],
+  seenMessages: new Set(),
+  rowSnapshots: new Map(),
+  initialized: false,
+  observer: null,
+  scheduled: false,
+  eventKeys: new Set()
+};
+window.__autochatObserver = state;
+
+const norm = value => String(value || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
+const contactForLabel = label => {
+  const key = norm(label);
+  if (!key) return null;
+  return contacts.find(c => norm(c.whatsapp_name) === key) || null;
+};
+const pushEvent = event => {
+  const key = [event.type, event.phone || "", event.message_id || "", event.snapshot || ""].join("|");
+  if (state.eventKeys.has(key)) return;
+  state.eventKeys.add(key);
+  state.events.push(event);
+  while (state.events.length > 500) {
+    const dropped = state.events.shift();
+    state.eventKeys.delete([dropped.type, dropped.phone || "", dropped.message_id || "", dropped.snapshot || ""].join("|"));
+  }
+  while (state.waiters.length && state.events.length) {
+    const waiter = state.waiters.shift();
+    clearTimeout(waiter.timer);
+    waiter.done(state.events.splice(0, state.events.length));
+  }
+};
+const readText = element => {
+  const values = [];
+  const seen = new Set();
+  for (const node of element.querySelectorAll('span.selectable-text, [data-testid="selectable-text"]')) {
+    const value = (node.innerText || node.textContent || "").trim();
+    if (value && !seen.has(value)) {
+      seen.add(value);
+      values.push(value);
+    }
+  }
+  return values.join("\n").slice(0, 700);
+};
+const messageIdentity = element => {
+  const holder = element.matches("[data-id]") ? element : element.querySelector("[data-id]");
+  const id = holder?.getAttribute("data-id");
+  if (id) return id;
+  const tagged = element.matches("[data-pre-plain-text]")
+    ? element.getAttribute("data-pre-plain-text")
+    : element.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text");
+  return tagged || "";
+};
+const activeContact = () => {
+  if (state.activePhone) return contacts.find(c => c.phone_e164 === state.activePhone) || null;
+  const header = document.querySelector('#main header [title], [data-testid="conversation-header"] [title]');
+  return header ? contactForLabel(header.getAttribute("title")) : null;
+};
+const unreadPresent = row => {
+  const indicators = row.querySelectorAll(
+    '[data-testid*="unread" i], [aria-label*="unread" i], [title*="unread" i], ' +
+    '[aria-label*="new message" i], [data-icon*="unread" i]'
+  );
+  if (indicators.length) return true;
+  const accessible = [
+    row.getAttribute("aria-label") || "",
+    ...Array.from(row.querySelectorAll("[aria-label]"), n => n.getAttribute("aria-label") || "")
+  ].join(" ");
+  return /\bunread\b|\bnew messages?\b/i.test(accessible);
+};
+const rowLabel = row => {
+  const titled = row.querySelector('[data-testid="cell-frame-title"][title], span[title], [title]');
+  if (titled?.getAttribute("title")) return titled.getAttribute("title");
+  const labelled = row.querySelector("[aria-label]");
+  return labelled?.getAttribute("aria-label") || "";
+};
+const scan = () => {
+  const first = !state.initialized;
+  const active = activeContact();
+  const phone = active?.phone_e164 || state.activePhone;
+
+  if (phone) {
+    const nodes = document.querySelectorAll(
+      '#main [data-testid="msg-container"], #main .message-in, #main .message-out'
+    );
+    for (const node of nodes) {
+      const incoming = Boolean(node.closest(".message-in") || node.classList.contains("message-in"));
+      const outgoing = Boolean(node.closest(".message-out") || node.classList.contains("message-out"));
+      if (!incoming && !outgoing) continue;
+      const text = readText(node);
+      if (!text) continue;
+      const rawId = messageIdentity(node);
+      const id = rawId || (incoming ? "in:" : "out:") + text;
+      const unique = phone + "|" + id + "|" + (incoming ? "in" : "out");
+      if (first) {
+        state.seenMessages.add(unique);
+      } else if (incoming && !state.seenMessages.has(unique)) {
+        state.seenMessages.add(unique);
+        pushEvent({
+          type: "incoming",
+          phone,
+          message_id: rawId,
+          text,
+          observed_at: Date.now()
+        });
+      } else {
+        state.seenMessages.add(unique);
+      }
+    }
+  }
+
+  const pane = document.querySelector("#pane-side");
+  if (pane) {
+    const rows = pane.querySelectorAll(
+      '[data-testid="cell-frame-container"], [role="listitem"], [role="row"]'
+    );
+    for (const row of rows) {
+      if (!row.isConnected) continue;
+      const label = rowLabel(row);
+      const contact = contactForLabel(label);
+      if (!contact) continue;
+      const unread = unreadPresent(row);
+      const snapshot = norm(row.innerText || "") + "|" + norm(row.getAttribute("aria-label") || "") + "|" + unread;
+      const previous = state.rowSnapshots.get(contact.phone_e164);
+      state.rowSnapshots.set(contact.phone_e164, snapshot);
+      if (unread && ((first && emitInitialUnread) || (!first && previous !== snapshot))) {
+        pushEvent({
+          type: "unread_contact",
+          phone: contact.phone_e164,
+          chat_name: contact.whatsapp_name,
+          snapshot,
+          observed_at: Date.now()
+        });
+      }
+    }
+  }
+  state.initialized = true;
+};
+const scheduleScan = () => {
+  if (state.scheduled) return;
+  state.scheduled = true;
+  queueMicrotask(() => {
+    state.scheduled = false;
+    try { scan(); } catch (error) { /* a transient WhatsApp DOM change is harmless */ }
+  });
+};
+
+try {
+  scan();
+  state.observer = new MutationObserver(scheduleScan);
+  state.observer.observe(document.body, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["aria-label", "data-testid", "title", "class"]
+  });
+  return {installed: true, mappedContacts: contacts.length};
+} catch (error) {
+  return {installed: false, error: String(error)};
+}
+"""
+
+OBSERVER_WAIT_SCRIPT = r"""
+const timeoutMs = Math.max(100, Number(arguments[0] || 15000));
+const done = arguments[arguments.length - 1];
+const state = window.__autochatObserver;
+if (!state) return done([]);
+if (state.events.length) return done(state.events.splice(0, state.events.length));
+let settled = false;
+const waiter = {
+  done: events => {
+    if (settled) return;
+    settled = true;
+    done(events);
+  },
+  timer: null
+};
+waiter.timer = setTimeout(() => {
+  if (settled) return;
+  settled = true;
+  const index = state.waiters.indexOf(waiter);
+  if (index >= 0) state.waiters.splice(index, 1);
+  done([]);
+}, timeoutMs);
+state.waiters.push(waiter);
+"""
 
 def normalize_phone(raw_phone: str, country_code: str) -> str:
-    """Return WhatsApp's digits-only international number."""
-    raw_phone = raw_phone.strip()
+    """Return a validated digits-only international phone number."""
+    raw_phone = str(raw_phone or "").strip()
+    country_code = re.sub(r"\D", "", str(country_code or ""))
     digits = re.sub(r"\D", "", raw_phone)
+    if not digits:
+        raise ValueError("Contact phone number is empty.")
     if raw_phone.startswith("+"):
         normalized = digits
     elif len(digits) == 10:
+        if not country_code:
+            raise ValueError("Set a valid country_code for 10-digit local numbers.")
         normalized = country_code + digits
-    elif digits.startswith(country_code) and len(digits) > 10:
-        normalized = digits
     elif 8 <= len(digits) <= 15:
         normalized = digits
     else:
@@ -49,25 +260,35 @@ def normalize_phone(raw_phone: str, country_code: str) -> str:
             f"Invalid phone number {raw_phone!r}. Use 10 local digits or full "
             "international format such as +919876543210."
         )
-
     if not 8 <= len(normalized) <= 15:
         raise ValueError(f"Phone number {raw_phone!r} must have 8 to 15 digits.")
     return normalized
 
 
-def load_config() -> tuple[list[dict], int, int, int]:
-    if not CONFIG_FILE.exists():
-        raise FileNotFoundError(
-            "contacts.json nahi mila. Project folder mein contacts.example.json "
-            "ko dekhkar contacts.json banao."
-        )
+def _strict_bool(value: Any, field: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be true or false (JSON boolean), not a string/number.")
+    return value
 
-    data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+
+def load_config() -> tuple[list[dict], int, int, bool]:
+    if not CONFIG_FILE.is_file():
+        raise FileNotFoundError(
+            "contacts.json nahi mila. contacts.example.json ko contacts.json naam se copy karein."
+        )
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"contacts.json JSON format invalid hai: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError("contacts.json ka top-level value JSON object hona chahiye.")
+
     country_code = re.sub(r"\D", "", str(data.get("country_code", "91")))
     if not country_code:
         raise ValueError("contacts.json mein country_code set karein.")
-
-    poll_seconds = max(5, min(120, int(data.get("poll_seconds", 12))))
+    dry_run = _strict_bool(data.get("dry_run"), "dry_run", True)
     history_messages = max(5, min(50, int(data.get("history_messages", 25))))
     memory_messages = max(20, min(300, int(data.get("memory_messages", 120))))
 
@@ -75,27 +296,38 @@ def load_config() -> tuple[list[dict], int, int, int]:
     if not isinstance(configured, list):
         raise ValueError("contacts.json ka 'contacts' field list hona chahiye.")
 
-    contacts = []
-    seen = set()
-    for item in configured:
-        if not isinstance(item, dict) or not item.get("enabled", False):
+    contacts: list[dict] = []
+    seen: set[str] = set()
+    for index, item in enumerate(configured, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"contacts[{index - 1}] JSON object hona chahiye.")
+        enabled = _strict_bool(item.get("enabled"), f"contacts[{index - 1}].enabled", False)
+        auto_send = _strict_bool(item.get("auto_send"), f"contacts[{index - 1}].auto_send", False)
+        if not enabled:
             continue
         phone = normalize_phone(str(item.get("phone", "")), country_code)
         if phone in seen:
             raise ValueError(f"Duplicate contact number: {phone}")
         seen.add(phone)
+        name = str(item.get("name") or f"+{phone}").strip()
+        whatsapp_name = str(item.get("whatsapp_name") or name).strip()
+        if not whatsapp_name:
+            raise ValueError(f"contacts[{index - 1}].whatsapp_name cannot be empty.")
         contact = dict(item)
-        contact["phone_e164"] = phone
-        contact["name"] = str(item.get("name") or f"+{phone}")
-        contact["relationship"] = str(item.get("relationship") or "partner")
-        contact["memory_notes"] = str(item.get("memory_notes") or "").strip()
-        contact["tone"] = str(item.get("tone") or "romantic and sweet")
-        contact["auto_send"] = bool(item.get("auto_send", False))
+        contact.update({
+            "phone_e164": phone,
+            "name": name,
+            "whatsapp_name": whatsapp_name,
+            "relationship": str(item.get("relationship") or "friend"),
+            "memory_notes": str(item.get("memory_notes") or "").strip(),
+            "tone": str(item.get("tone") or "warm and natural"),
+            "auto_send": auto_send,
+        })
         contacts.append(contact)
 
     if not contacts:
         raise ValueError("contacts.json mein kam se kam ek enabled contact add karein.")
-    return contacts, poll_seconds, history_messages, memory_messages
+    return contacts, history_messages, memory_messages, dry_run
 
 
 def _find_composer(driver):
@@ -107,15 +339,40 @@ def _find_composer(driver):
 
 
 def open_contact_chat(driver, contact: dict) -> None:
-    """Open only the configured phone number, using the existing WhatsApp profile."""
+    """Open only the configured phone number in the existing WhatsApp session."""
     number = contact["phone_e164"]
     driver.get(f"https://web.whatsapp.com/send?phone={number}")
     try:
         WebDriverWait(driver, 45).until(lambda browser: _find_composer(browser))
     except TimeoutException as error:
         raise RuntimeError(
-            f"{contact['name']} (+{number}) ki chat nahi khuli. Number WhatsApp "
-            "par registered hai ya nahi aur web login check karein."
+            f"{contact['name']} (+{number}) ki chat nahi khuli. Number WhatsApp par "
+            "registered hai ya web login/session check karein."
+        ) from error
+
+
+def install_dom_observer(driver, contacts: list[dict], active_phone: str | None, emit_initial_unread: bool) -> None:
+    payload = [
+        {"phone_e164": c["phone_e164"], "whatsapp_name": c["whatsapp_name"]}
+        for c in contacts
+    ]
+    result = driver.execute_script(
+        OBSERVER_INSTALL_SCRIPT, payload, active_phone, emit_initial_unread
+    )
+    if not isinstance(result, dict) or not result.get("installed"):
+        raise RuntimeError(f"WhatsApp DOM observer install nahi hua: {result}")
+
+
+def wait_for_dom_events(driver, timeout_seconds: float = OBSERVER_WAIT_SECONDS) -> list[dict]:
+    """Wait for MutationObserver events; there is no periodic DOM polling."""
+    try:
+        result = driver.execute_async_script(
+            OBSERVER_WAIT_SCRIPT, int(max(0.1, timeout_seconds) * 1000)
+        )
+        return result if isinstance(result, list) else []
+    except WebDriverException as error:
+        raise RuntimeError(
+            f"WhatsApp DOM event wait fail hua: {error}. Page reload karke retry karein."
         ) from error
 
 
@@ -174,8 +431,8 @@ def _message_identity(driver, element, direction: str, text: str) -> str:
 
 def extract_visible_messages(driver) -> list[dict[str, str]]:
     elements = driver.find_elements(By.CSS_SELECTOR, MESSAGE_CONTAINER_SELECTOR)
-    records = []
-    seen = set()
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
     for element in elements:
         try:
             if not element.is_displayed():
@@ -190,14 +447,12 @@ def extract_visible_messages(driver) -> list[dict[str, str]]:
             if identity in seen:
                 continue
             seen.add(identity)
-            records.append(
-                {
-                    "id": identity,
-                    "speaker": "Her" if direction == "incoming" else "You",
-                    "direction": direction,
-                    "text": text[:MAX_MESSAGE_CHARS],
-                }
-            )
+            records.append({
+                "id": identity,
+                "speaker": "Contact" if direction == "incoming" else "You",
+                "direction": direction,
+                "text": text[:MAX_MESSAGE_CHARS],
+            })
         except WebDriverException:
             continue
     return records
@@ -219,24 +474,31 @@ def _find_message_scroller(driver):
 
 
 def read_recent_history(driver, history_limit: int) -> list[dict[str, str]]:
-    """Load a bounded slice of older messages, then return to the newest messages."""
-    messages = extract_visible_messages(driver)
-    for _ in range(8):
-        if len(messages) >= history_limit:
-            break
+    """Accumulate older virtualized messages instead of replacing each scroll slice."""
+    collected: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for _ in range(12):
+        visible = extract_visible_messages(driver)
+        fresh = [message for message in visible if message["id"] not in seen]
+        if fresh:
+            for message in fresh:
+                seen.add(message["id"])
+            collected = fresh + collected
+
         scroller = _find_message_scroller(driver)
         if scroller is None:
             break
         try:
-            previous_top = driver.execute_script("return arguments[0].scrollTop", scroller)
-            if previous_top <= 0:
+            position = driver.execute_script("return arguments[0].scrollTop", scroller)
+            if position <= 1:
                 break
-            previous_count = len(messages)
-            driver.execute_script("arguments[0].scrollTop = 0", scroller)
-            time.sleep(0.4)
-            messages = extract_visible_messages(driver)
-            if len(messages) <= previous_count and previous_top <= 1:
-                break
+            driver.execute_script(
+                "arguments[0].scrollTop = Math.max(0, arguments[0].scrollTop - "
+                "Math.max(300, arguments[0].clientHeight * 0.75))",
+                scroller,
+            )
+            time.sleep(0.2)
         except WebDriverException:
             break
 
@@ -246,12 +508,16 @@ def read_recent_history(driver, history_limit: int) -> list[dict[str, str]]:
             driver.execute_script(
                 "arguments[0].scrollTop = arguments[0].scrollHeight", scroller
             )
-            time.sleep(0.25)
+            time.sleep(0.2)
         except WebDriverException:
             pass
 
-    messages = extract_visible_messages(driver)
-    return messages[-history_limit:]
+    latest = extract_visible_messages(driver)
+    for message in latest:
+        if message["id"] not in seen:
+            seen.add(message["id"])
+            collected.append(message)
+    return collected[-history_limit:]
 
 
 def _merge_memory(
@@ -261,24 +527,18 @@ def _merge_memory(
 ) -> list[dict[str, str]]:
     if not saved:
         return live[-memory_limit:]
-
     saved_index = {message.get("id"): index for index, message in enumerate(saved)}
     overlap = next(
         (
-            (live_index, saved_index[message.get("id")])
-            for live_index, message in enumerate(live)
+            saved_index[message.get("id")]
+            for message in live
             if message.get("id") in saved_index
         ),
         None,
     )
-    if overlap:
-        _, first_saved_index = overlap
-        combined = saved[:first_saved_index] + live
-    else:
-        combined = live
-
-    unique = []
-    seen = set()
+    combined = saved[:overlap] + live if overlap is not None else live
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
     for message in combined:
         message_id = message.get("id")
         if message_id and message_id not in seen:
@@ -295,12 +555,18 @@ def _state_file(phone: str) -> Path:
 def _read_state(phone: str) -> dict:
     path = _state_file(phone)
     if not path.exists():
-        return {"last_processed_id": None, "history": []}
+        return {"initialized": False, "last_processed_id": None, "history": []}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {"last_processed_id": None, "history": []}
-    except (OSError, json.JSONDecodeError):
-        return {"last_processed_id": None, "history": []}
+        if not isinstance(value, dict):
+            raise ValueError("state root is not an object")
+        value.setdefault("initialized", False)
+        value.setdefault("last_processed_id", None)
+        value.setdefault("history", [])
+        return value
+    except (OSError, json.JSONDecodeError, ValueError):
+        # Corrupt state is preserved for inspection; do not silently overwrite it.
+        raise RuntimeError(f"Local chat state corrupt hai: {path}. Backup karke inspect karein.")
 
 
 def _write_state(phone: str, state: dict) -> None:
@@ -320,14 +586,14 @@ def _contact_context(contact: dict) -> str:
         f"Name or label: {contact['name']}",
     ]
     if contact["memory_notes"]:
-        lines.append(f"Long-term notes from account owner: {contact['memory_notes']}")
+        lines.append(f"Style notes supplied by the account owner: {contact['memory_notes']}")
     return "\n".join(lines)
 
 
 def _send_message(driver, draft: str) -> bool:
     text = " ".join(draft.split()).strip()
     if not text or len(text) > MAX_MESSAGE_CHARS:
-        raise RuntimeError("AI reply khaali ya bahut lamba tha; send nahi kiya.")
+        raise RuntimeError("AI reply khaali ya 700 characters se lamba tha; send nahi kiya.")
 
     composer = _find_composer(driver)
     if composer is None:
@@ -335,7 +601,7 @@ def _send_message(driver, draft: str) -> bool:
     current_text = (composer.get_attribute("textContent") or composer.text or "").strip()
     if current_text:
         raise RuntimeError(
-            "WhatsApp message box mein pehle se unsent text hai; usse chhede bina ruk gaya."
+            "WhatsApp message box mein pehle se unsent text hai; use chhede bina ruk gaya."
         )
 
     before_ids = {
@@ -343,23 +609,59 @@ def _send_message(driver, draft: str) -> bool:
         for message in extract_visible_messages(driver)
         if message["direction"] == "outgoing"
     }
-    composer.click()
-    composer.send_keys(text)
-    composer.send_keys(Keys.ENTER)
+    attempted = False
+    try:
+        composer.click()
+        attempted = True
+        composer.send_keys(text)
+        composer.send_keys(Keys.ENTER)
+    except WebDriverException as error:
+        if attempted:
+            raise SendUncertain(
+                "Send action ke baad browser error aaya; duplicate se bachne ke liye "
+                "automatic resend nahi kiya. WhatsApp chat manually verify karein."
+            ) from error
+        raise
 
     def sent(browser) -> bool:
         return any(
             message["direction"] == "outgoing"
-            and message["text"].strip() == text
+            and " ".join(message["text"].split()).strip() == text
             and message["id"] not in before_ids
-            for message in extract_visible_messages(browser)[-8:]
+            for message in extract_visible_messages(browser)[-12:]
         )
 
     try:
-        WebDriverWait(driver, 12).until(sent)
+        WebDriverWait(driver, 15).until(sent)
         return True
-    except TimeoutException:
-        return False
+    except TimeoutException as error:
+        raise SendUncertain(
+            "WhatsApp ne send confirm nahi kiya. Chat manually check karein; "
+            "duplicate se bachne ke liye same incoming message auto-retry nahi hoga."
+        ) from error
+
+
+class SendUncertain(RuntimeError):
+    """The send action may have reached WhatsApp, so automatic resend is unsafe."""
+
+
+def _pending_messages(history: list[dict[str, str]], state: dict) -> list[dict[str, str]]:
+    incoming = [message for message in history if message["direction"] == "incoming"]
+    marker = state.get("last_processed_id")
+    if marker is None:
+        return incoming
+    ids = [message["id"] for message in history]
+    if marker not in ids:
+        # Conservative stop: if history truncation removed the marker, don't risk
+        # replying to an old message or duplicating a message already handled.
+        if incoming and incoming[-1]["id"] != marker:
+            print("[SKIP] Last processed marker history mein nahi mila; duplicate risk ke kaaran auto-send roka.")
+        return []
+    marker_index = ids.index(marker)
+    return [
+        message for index, message in enumerate(history)
+        if index > marker_index and message["direction"] == "incoming"
+    ]
 
 
 def _handle_new_messages(
@@ -370,113 +672,66 @@ def _handle_new_messages(
     api_key: str,
     memory_limit: int,
     history_limit: int,
+    dry_run: bool,
 ) -> None:
     history = _merge_memory(state.get("history", []), live, memory_limit)
-    state["history"] = history
-
-    incoming = [message for message in history if message["direction"] == "incoming"]
     if not state.get("initialized", False):
-        state["initialized"] = True
-        if incoming:
-            state["last_processed_id"] = incoming[-1]["id"]
-            print(
-                f"[READY] {contact['name']} (+{contact['phone_e164']}): "
-                "purane messages context ke liye load hue; naye message ka wait hai."
-            )
-        else:
-            print(
-                f"[READY] {contact['name']}: chat baseline set; "
-                "ab naye incoming messages ka wait hai."
-            )
+        incoming = [message for message in history if message["direction"] == "incoming"]
+        state.update({
+            "initialized": True,
+            "last_processed_id": incoming[-1]["id"] if incoming else None,
+            "history": history,
+        })
+        _write_state(contact["phone_e164"], state)
+        print(f"[BASELINE] {contact['name']}: existing messages ko reply nahi bheja.")
+        return
+
+    pending = _pending_messages(history, state)
+    if not pending:
+        state["history"] = history
         _write_state(contact["phone_e164"], state)
         return
 
-    if not incoming:
-        _write_state(contact["phone_e164"], state)
-        return
-
-    last_processed_id = state.get("last_processed_id")
-    ordered_ids = [message["id"] for message in history]
-    if last_processed_id is None:
-        marker_index = -1
-    elif last_processed_id in ordered_ids:
-        marker_index = ordered_ids.index(last_processed_id)
-    else:
-        if incoming[-1]["id"] != last_processed_id:
-            state["last_processed_id"] = incoming[-1]["id"]
-            _write_state(contact["phone_e164"], state)
-            print(
-                f"[SKIP] {contact['name']}: purana marker history mein nahi mila; "
-                "duplicate ya purana reply bhejne se bachne ke liye latest message skip kiya."
-            )
-        return
-
-    pending_indexes = [
-        index
-        for index in range(marker_index + 1, len(history))
-        if history[index]["direction"] == "incoming"
-    ]
-    if not pending_indexes:
-        _write_state(contact["phone_e164"], state)
-        return
-
-    timeline = history[: marker_index + 1]
-    cursor = marker_index + 1
-    for source_index in pending_indexes:
-        timeline.extend(history[cursor : source_index + 1])
-        cursor = source_index + 1
-        current = history[source_index]
-
-        # Save first so an interrupted send cannot be accidentally duplicated.
-        state["last_processed_id"] = current["id"]
-        state["history"] = history[-memory_limit:]
-        _write_state(contact["phone_e164"], state)
-
+    timeline = list(history)
+    for current in pending:
         prompt_history = [
             {"speaker": message["speaker"], "text": message["text"]}
-            for message in timeline[-history_limit - 1 : -1]
-        ]
-        try:
-            draft = make_draft(
-                api_key=api_key,
-                message=current["text"],
-                context=_contact_context(contact),
-                tone=contact["tone"],
-                history=prompt_history,
-            )
-        except RuntimeError as error:
-            print(
-                f"[NO REPLY] {contact['name']}: AI request failed ({error}). "
-                "Is message ko manually check karein."
-            )
-            break
+            for message in timeline
+            if message["id"] != current["id"]
+        ][-history_limit:]
+
+        # Do not advance the processed marker before Groq succeeds. Transient API
+        # failures therefore remain recoverable instead of silently losing replies.
+        draft = make_draft(
+            api_key=api_key,
+            message=current["text"],
+            context=_contact_context(contact),
+            tone=contact["tone"],
+            history=prompt_history,
+        )
 
         if draft == HUMAN_REVIEW_REQUIRED:
-            print(
-                f"[REVIEW] {contact['name']}: situation ko insaan khud handle kare; "
-                "automatic reply nahi bheja."
-            )
+            state["last_processed_id"] = current["id"]
+            state["history"] = history[-memory_limit:]
+            _write_state(contact["phone_e164"], state)
+            print(f"[REVIEW] {contact['name']}: sensitive/ambiguous message; human review needed.")
             continue
 
-        if not contact["auto_send"]:
-            print(f"[DRAFT] {contact['name']}: {draft}")
+        if not contact["auto_send"] or dry_run:
+            mode = "DRY RUN" if dry_run else "DRAFT ONLY"
+            print(f"[{mode}] {contact['name']}: {draft}")
+            state["last_processed_id"] = current["id"]
+            state["history"] = history[-memory_limit:]
+            _write_state(contact["phone_e164"], state)
             continue
 
         try:
-            sent_ok = _send_message(driver, draft)
-        except (RuntimeError, WebDriverException) as error:
-            print(
-                f"[SEND ERROR] {contact['name']}: {error}. "
-                "WhatsApp chat manually check karein."
-            )
-            break
-
-        if not sent_ok:
-            print(
-                f"[CHECK] {contact['name']}: send confirm nahi hua. "
-                "WhatsApp chat manually check karein; duplicate se bachne ke liye "
-                "same incoming message dobara auto-send nahi hoga."
-            )
+            _send_message(driver, draft)
+        except SendUncertain as error:
+            state["last_processed_id"] = current["id"]
+            state["history"] = history[-memory_limit:]
+            _write_state(contact["phone_e164"], state)
+            print(f"[SEND CHECK] {contact['name']}: {error}")
             break
 
         assistant_message = {
@@ -488,75 +743,150 @@ def _handle_new_messages(
             "text": " ".join(draft.split())[:MAX_MESSAGE_CHARS],
         }
         timeline.append(assistant_message)
-        print(f"[SENT] {contact['name']} (+{contact['phone_e164']}) ke liye reply bhej diya.")
+        state["last_processed_id"] = current["id"]
+        state["history"] = timeline[-memory_limit:]
+        _write_state(contact["phone_e164"], state)
+        print(f"[SENT] {contact['name']}: reply sent and verified.")
+
+
+def _baseline_contact(driver, contact: dict, history_limit: int, memory_limit: int) -> bool:
+    """Create a safe startup baseline, or report whether old pending messages exist."""
+    open_contact_chat(driver, contact)
+    live = read_recent_history(driver, memory_limit)
+    state = _read_state(contact["phone_e164"])
+    history = _merge_memory(state.get("history", []), live, memory_limit)
+    if not state.get("initialized", False):
+        incoming = [message for message in history if message["direction"] == "incoming"]
+        state.update({
+            "initialized": True,
+            "last_processed_id": incoming[-1]["id"] if incoming else None,
+            "history": history,
+        })
+        _write_state(contact["phone_e164"], state)
+        print(f"[BASELINE] {contact['name']}: existing chat captured; old messages won't trigger replies.")
+        return False
+
+    pending = _pending_messages(history, state)
+    state["history"] = history
+    _write_state(contact["phone_e164"], state)
+    return bool(pending)
+
+
+def _process_contact(
+    driver,
+    contact: dict,
+    contacts: list[dict],
+    active_phone: str | None,
+    api_key: str,
+    history_limit: int,
+    memory_limit: int,
+    dry_run: bool,
+) -> str:
+    if active_phone != contact["phone_e164"]:
+        open_contact_chat(driver, contact)
+        active_phone = contact["phone_e164"]
+        # Navigation can replace the DOM and destroy the previous observer.
+        install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
+
+    live = read_recent_history(driver, memory_limit)
+    state = _read_state(contact["phone_e164"])
+    _handle_new_messages(
+        driver, contact, live, state, api_key, memory_limit, history_limit, dry_run
+    )
+    return active_phone
 
 
 def main() -> None:
     driver = None
     try:
-        contacts, poll_seconds, history_limit, memory_limit = load_config()
-        if not contacts:
-            raise ValueError("Koi enabled contact nahi hai.")
-
+        contacts, history_limit, memory_limit, dry_run = load_config()
         print("Enabled contacts:")
         for contact in contacts:
-            mode = "AUTO SEND" if contact["auto_send"] else "DRAFT ONLY"
-            print(f"  - {contact['name']}: +{contact['phone_e164']} ({mode})")
-        print(
-            "\nBot sirf listed contacts ke naye incoming text messages dekhega. "
-            "Purani chat context ke liye padhi jayegi; startup par purane message "
-            "ka reply nahi bhejega. Ctrl+C se band karein."
-        )
+            mode = "DRAFT" if not contact["auto_send"] else ("DRY RUN" if dry_run else "AUTO SEND")
+            print(f"  - {contact['name']} | WhatsApp chat: {contact['whatsapp_name']} | {mode}")
+        if dry_run:
+            print("\n[SAFE MODE] dry_run=true hai. Koi WhatsApp message send nahi hoga.")
+        else:
+            print("\n[WARNING] dry_run=false. auto_send=true contacts ko real messages bheje ja sakte hain.")
+
         api_key = get_api_key()
         driver = start_chrome()
+        driver.set_script_timeout(OBSERVER_WAIT_SECONDS + 5)
         driver.get("https://web.whatsapp.com/")
         wait_for_whatsapp_login(driver)
 
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        active_phone = None
+        # One-time warm-up creates per-contact message markers. Once monitoring
+        # starts, only messages arriving after each marker can trigger replies.
+        pending_contacts: set[str] = set()
+        active_phone: str | None = None
+        for contact in contacts:
+            try:
+                has_pending = _baseline_contact(driver, contact, history_limit, memory_limit)
+                active_phone = contact["phone_e164"]
+                if has_pending:
+                    pending_contacts.add(contact["phone_e164"])
+            except (RuntimeError, WebDriverException) as error:
+                print(f"[WARMUP ERROR] {contact['name']}: {error}")
+
+        install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
+        contacts_by_phone = {contact["phone_e164"]: contact for contact in contacts}
+        retry_schedule: dict[str, tuple[float, int]] = {}
+
         print(
-            f"\nMonitoring shuru. Har {poll_seconds} second mein configured chats check hongi."
+            "\n[READY] Event-driven monitoring active. MutationObserver WhatsApp DOM changes "
+            "detect karega; fixed 12-second polling nahi hai. Ctrl+C se stop karein."
         )
+
         while True:
-            for contact in contacts:
-                if active_phone != contact["phone_e164"]:
-                    try:
-                        open_contact_chat(driver, contact)
-                        active_phone = contact["phone_e164"]
-                    except RuntimeError as error:
-                        print(f"[WAIT] {error}")
-                        active_phone = None
-                        continue
+            # Recover messages that were pending at startup or failed transiently.
+            now = time.monotonic()
+            due_phones = set(pending_contacts)
+            pending_contacts.clear()
+            for phone, (due, _attempt) in list(retry_schedule.items()):
+                if due <= now:
+                    due_phones.add(phone)
 
-                live = read_recent_history(driver, memory_limit)
-                state = _read_state(contact["phone_e164"])
-                if not live:
-                    if not state.get("initialized", False):
-                        state["initialized"] = True
-                        state["last_processed_id"] = None
-                        state["history"] = []
-                        _write_state(contact["phone_e164"], state)
-                        print(
-                            f"[READY] {contact['name']}: empty chat baseline set; "
-                            "ab naye incoming messages ka wait hai."
-                        )
-                    else:
-                        print(
-                            f"[WAIT] {contact['name']}: visible text messages nahi mile; "
-                            "WhatsApp layout ya number check karein."
-                        )
+            for phone in due_phones:
+                contact = contacts_by_phone.get(phone)
+                if not contact:
                     continue
+                try:
+                    active_phone = _process_contact(
+                        driver, contact, contacts, active_phone, api_key,
+                        history_limit, memory_limit, dry_run
+                    )
+                    retry_schedule.pop(phone, None)
+                except GroqAPIError as error:
+                    if error.retryable:
+                        previous_attempt = retry_schedule.get(phone, (0.0, 0))[1]
+                        attempt = previous_attempt + 1
+                        delay = min(60, 5 * (2 ** min(attempt - 1, 4)))
+                        retry_schedule[phone] = (time.monotonic() + delay, attempt)
+                        print(f"[RETRY] {contact['name']}: Groq temporary failure; retry in {delay}s. {error}")
+                    else:
+                        retry_schedule.pop(phone, None)
+                        print(f"[GROQ ERROR] {contact['name']}: {error}. Message marker remains unadvanced.")
+                except (RuntimeError, WebDriverException) as error:
+                    retry_schedule[phone] = (time.monotonic() + 15, 1)
+                    print(f"[CONTACT ERROR] {contact['name']}: {error}. Retry in 15s.")
 
-                _handle_new_messages(
-                    driver,
-                    contact,
-                    live,
-                    state,
-                    api_key,
-                    memory_limit,
-                    history_limit,
-                )
-            time.sleep(poll_seconds)
+            next_due = min((value[0] for value in retry_schedule.values()), default=None)
+            timeout = OBSERVER_WAIT_SECONDS
+            if next_due is not None:
+                timeout = min(timeout, max(0.2, next_due - time.monotonic()))
+
+            events = wait_for_dom_events(driver, timeout)
+            # Coalesce a burst into one contact visit. The chat history reader then
+            # processes all incoming messages after that contact's saved marker.
+            event_phones = {
+                str(event.get("phone"))
+                for event in events
+                if event.get("type") in {"incoming", "unread_contact"}
+                and str(event.get("phone")) in contacts_by_phone
+            }
+            for phone in event_phones:
+                pending_contacts.add(phone)
+
     except (EOFError, KeyboardInterrupt):
         print("\nAutoChatBot band ho gaya.")
     except (FileNotFoundError, ValueError, RuntimeError) as error:
