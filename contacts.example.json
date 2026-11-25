@@ -1,0 +1,17 @@
+{
+  "country_code": "91",
+  "poll_seconds": 12,
+  "history_messages": 25,
+  "memory_messages": 120,
+  "contacts": [
+    {
+      "phone": "9876543210",
+      "name": "Example contact",
+      "relationship": "partner",
+      "tone": "romantic and sweet",
+      "memory_notes": "Optional: preferred name, shared context, boundaries, or inside jokes.",
+      "enabled": false,
+      "auto_send": false
+    }
+  ]
+}

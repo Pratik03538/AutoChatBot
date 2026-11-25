@@ -8,10 +8,11 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Local credentials, logs, and chat exports.
+# Local credentials, contact numbers, logs, and chat memory.
 .env
 .env.*
 !.env.example
+contacts.json
 *.log
 logs/
 chat_data/
