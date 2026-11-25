@@ -7,9 +7,10 @@ Windows Python project for event-driven WhatsApp Web monitoring and Groq-assiste
 - Opens WhatsApp Web in Chrome using a dedicated persistent local profile at `chrome_profile/`.
 - Uses Selenium to install a browser-side JavaScript `MutationObserver`. The observer watches the active conversation for incoming text messages and the chat list for unread changes to explicitly configured contacts.
 - Wakes Python through an asynchronous browser event queue. It does not wait for a fixed 12-second polling interval.
-- Matches inactive chats by their exact WhatsApp display title (`whatsapp_name`), then opens only the configured phone number and reads recent text context.
-- Sends the latest incoming message and bounded recent history to Groq to produce a concise reply in the conversation's language.
-- Persists message IDs and chat context locally to avoid routine duplicate replies and to recover messages after transient API errors.
+- Matches inactive chats by their exact WhatsApp display title (`whatsapp_name`), then opens only the configured phone number.
+- Reads at most the newest 10 text messages already rendered in the active chat. It does not scroll through older history or load the full conversation.
+- Sends the last 10 conversation messages (including the latest incoming message) to Groq as a role-preserving `messages` array (`user` / `assistant`) for concise, context-aware drafting.
+- Persists at most 10 recent message records locally per contact for context and message-state recovery.
 - Uses a safe dry-run default. Real sending requires both global `dry_run: false` and that contact's `auto_send: true`.
 
 ## Important latency and reliability limits
@@ -51,8 +52,8 @@ Example contact configuration:
 {
   "country_code": "91",
   "dry_run": true,
-  "history_messages": 25,
-  "memory_messages": 120,
+  "history_messages": 10,
+  "memory_messages": 10,
   "contacts": [
     {
       "phone": "9876543210",
@@ -113,7 +114,7 @@ The program only monitors contacts in the local `contacts.json`. Do not configur
 
 ## Groq and privacy
 
-The local `.env` file contains the private API key. Recent WhatsApp text messages and style notes sent for each reply are transmitted to Groq for inference. Chat history, phone numbers, session cookies and message-processing state remain in local files excluded from Git. Avoid putting sensitive personal information in chat notes or sending sensitive conversations to an external model.
+The local `.env` file contains the private API key. At most the 10 most recent conversation messages currently rendered in the active WhatsApp chat, plus configured style notes, are sent to Groq for inference. The bot does not scroll backward or load the full conversation. Up to 10 recent message records, phone numbers, session cookies and processing state remain in local files excluded from Git. Avoid putting sensitive personal information in chat notes or sending sensitive conversations to an external model.
 
 The reply prompt asks Groq to match the incoming message's language, use history only as context, avoid inventing facts, and defer sensitive/ambiguous medical, legal, financial, safety or serious-conflict messages to a human. These checks reduce risk but cannot guarantee a correct reply. Review real-send behavior carefully.
 
