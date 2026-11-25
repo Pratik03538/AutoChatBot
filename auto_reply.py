@@ -132,15 +132,20 @@ const messageDirection = element => {
   return "unknown";
 };
 const messageIdentity = element => {
+  // WhatsApp may replace/re-render a bubble and change its wrapper data-id.
+  // The pre-plain-text metadata (timestamp + sender) survives that re-render;
+  // include visible text so multiple messages in the same minute remain distinct.
+  const metadataNode = element.matches("[data-pre-plain-text]")
+    ? element
+    : (element.closest("[data-pre-plain-text]") || element.querySelector("[data-pre-plain-text]"));
+  const metadata = metadataNode?.getAttribute("data-pre-plain-text") || "";
+  if (metadata) return "meta:" + metadata + "|" + readText(element);
+
   const holder = element.closest('[data-testid^="conv-msg-"][data-id]') ||
     (element.matches("[data-id]") ? element : null) ||
     element.closest("[data-id]") ||
     element.querySelector("[data-id]");
-  const id = holder?.getAttribute("data-id");
-  if (id) return id;
-  return element.matches("[data-pre-plain-text]")
-    ? (element.getAttribute("data-pre-plain-text") || "")
-    : (element.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "");
+  return holder?.getAttribute("data-id") || "";
 };
 const activeContact = () => {
   const header = document.querySelector('#main header');
@@ -434,7 +439,7 @@ def load_config() -> tuple[list[dict], int, int, bool]:
             "whatsapp_name": whatsapp_name,
             "relationship": str(item.get("relationship") or "friend"),
             "memory_notes": str(item.get("memory_notes") or "").strip(),
-            "tone": str(item.get("tone") or "warm and natural"),
+            "tone": str(item.get("tone") or "casual, natural and understated"),
             "auto_send": auto_send,
         })
         contacts.append(contact)
@@ -625,26 +630,37 @@ def _message_text(element) -> str:
 
 def _message_identity(driver, element, direction: str, text: str) -> str:
     try:
-        stable_id = driver.execute_script(
+        identity = driver.execute_script(
             """
             const node = arguments[0];
             const holder = node.closest('[data-testid^="conv-msg-"][data-id]') ||
               (node.matches('[data-id]') ? node : null) ||
               node.closest('[data-id]') || node.querySelector('[data-id]');
-            let meta = '';
-            if (node.matches('[data-pre-plain-text]')) {
-              meta = node.getAttribute('data-pre-plain-text') || '';
-            } else {
-              const item = node.querySelector('[data-pre-plain-text]');
-              meta = item ? (item.getAttribute('data-pre-plain-text') || '') : '';
-            }
-            return (holder && holder.getAttribute('data-id')) || meta;
+            const metadataNode = node.matches('[data-pre-plain-text]')
+              ? node
+              : (node.closest('[data-pre-plain-text]') || node.querySelector('[data-pre-plain-text]'));
+            return {
+              stableId: (holder && holder.getAttribute('data-id')) || '',
+              metadata: metadataNode
+                ? (metadataNode.getAttribute('data-pre-plain-text') || '')
+                : ''
+            };
             """,
             element,
         )
     except WebDriverException:
-        stable_id = ""
-    fingerprint = f"{stable_id}|{direction}|{text}"
+        identity = {}
+    if isinstance(identity, dict):
+        # Prefer timestamp/sender metadata to survive WhatsApp wrapper re-renders
+        # that replace data-id while preserving the actual message.
+        source_key = (
+            "meta:" + str(identity.get("metadata") or "")
+            if identity.get("metadata")
+            else str(identity.get("stableId") or "")
+        )
+    else:
+        source_key = str(identity or "")
+    fingerprint = f"{source_key}|{direction}|{text}"
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
 
 
