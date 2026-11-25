@@ -63,8 +63,8 @@ SYSTEM_PROMPT = (
 )
 
 AFFECTIONATE_STYLE_PATTERN = re.compile(
-    r"(?i)(?<!\\w)(?:jaan|janeman|jaaneman|baby|babe|sweetheart|darling|beautiful|"
-    r"my love|love you|miss you)(?!\\w)"
+    r"(?i)(?<!\w)(?:jaan|janeman|jaaneman|baby|babe|sweetheart|darling|beautiful|"
+    r"my love|love you|miss you)(?!\w)"
 )
 ROMANTIC_EMOJI_PATTERN = re.compile(r"[❤️💕💖💗💘💝💞💓💟😍😘🥰]")
 
@@ -268,7 +268,7 @@ def make_draft(
                     if not strict_style_retry_used:
                         strict_style_retry_used = True
                         messages[-1]["content"] += (
-                            "\\n\\nSTYLE VALIDATION FAILED: rewrite the reply in neutral, "
+                            "\n\nSTYLE VALIDATION FAILED: rewrite the reply in neutral, "
                             "casual Roman Hindi/Hinglish if appropriate. No pet names, flirting, "
                             "romance, affectionate claims or romantic emojis. Output only the "
                             "short corrected reply to the original incoming message above."
