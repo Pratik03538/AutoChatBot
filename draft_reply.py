@@ -9,8 +9,8 @@ import sys
 import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+from groq import APIConnectionError, APIStatusError, Groq
 
 
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -88,9 +88,9 @@ def choose_tone() -> str:
     return TONES.get(choice, TONES["1"])
 
 
-def _retry_delay(error: HTTPError, attempt: int) -> float:
+def _retry_delay(headers, attempt: int) -> float:
     """Use Retry-After when present, otherwise a small bounded backoff."""
-    retry_after = error.headers.get("Retry-After") if error.headers else None
+    retry_after = headers.get("Retry-After") if headers else None
     if retry_after:
         try:
             return max(1.0, min(12.0, float(retry_after)))
@@ -146,73 +146,78 @@ def make_draft(
         "temperature": 0.65,
         "max_completion_tokens": 180,
     }
-    request = Request(
-        API_URL,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
     last_error: GroqAPIError | None = None
-    for attempt in range(MAX_ATTEMPTS):
-        try:
-            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                raw = response.read().decode("utf-8")
-            result = json.loads(raw)
-            draft = result["choices"][0]["message"]["content"].strip()
-            if not draft:
-                raise GroqAPIError("Groq ne empty reply diya.", retryable=True)
-            if draft == HUMAN_REVIEW_REQUIRED:
-                return draft
-            draft = draft.replace(chr(96) * 3, "").strip().strip('"').strip()
-            if not draft:
-                raise GroqAPIError("Groq ne empty reply diya.", retryable=True)
-            if len(draft) > MAX_REPLY_CHARS:
-                raise GroqAPIError(
-                    f"Groq response {MAX_REPLY_CHARS} characters se lamba tha; safe sending roki.",
-                    retryable=False,
+    with Groq(
+        api_key=api_key,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        # The application owns bounded retry policy below. Disable SDK retries
+        # to avoid retry multiplication and ensure Cloudflare 403 is not retried.
+        max_retries=0,
+    ) as client:
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                result = client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.65,
+                    max_completion_tokens=180,
                 )
-            return draft
+                draft = (result.choices[0].message.content or "").strip()
+                if not draft:
+                    raise GroqAPIError("Groq ne empty reply diya.", retryable=True)
+                if draft == HUMAN_REVIEW_REQUIRED:
+                    return draft
+                draft = draft.replace(chr(96) * 3, "").strip().strip('"').strip()
+                if not draft:
+                    raise GroqAPIError("Groq ne empty reply diya.", retryable=True)
+                if len(draft) > MAX_REPLY_CHARS:
+                    raise GroqAPIError(
+                        f"Groq response {MAX_REPLY_CHARS} characters se lamba tha; safe sending roki.",
+                        retryable=False,
+                    )
+                return draft
 
-        except HTTPError as error:
-            detail = _error_detail(error.read().decode("utf-8", errors="replace"))
-            retryable = error.code in {408, 409, 425, 429, 498, 500, 502, 503, 504}
-            last_error = GroqAPIError(
-                f"Groq API error ({error.code}): {detail}",
-                retryable=retryable,
-                status_code=error.code,
-            )
-            if not retryable:
-                raise last_error from error
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(_retry_delay(error, attempt))
+            except APIStatusError as error:
+                status_code = error.status_code
+                response = getattr(error, "response", None)
+                raw_body = getattr(response, "text", "") or str(error)
+                detail = _error_detail(raw_body)
+                retryable = status_code in {408, 409, 425, 429, 498, 500, 502, 503, 504}
+                last_error = GroqAPIError(
+                    f"Groq API error ({status_code}): {detail}",
+                    retryable=retryable,
+                    status_code=status_code,
+                )
+                if not retryable:
+                    raise last_error from error
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(_retry_delay(getattr(response, "headers", None), attempt))
 
-        except (URLError, TimeoutError) as error:
-            last_error = GroqAPIError(
-                f"Groq network/timeout error: {getattr(error, 'reason', error)}",
-                retryable=True,
-            )
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(min(8.0, float(2 ** attempt)))
+            except APIConnectionError as error:
+                last_error = GroqAPIError(
+                    f"Groq network/timeout error: {error}",
+                    retryable=True,
+                )
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(min(8.0, float(2 ** attempt)))
 
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError) as error:
-            last_error = GroqAPIError(
-                f"Groq response format invalid hai: {error}",
-                retryable=True,
-            )
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(min(4.0, float(2 ** attempt)))
+            except (KeyError, IndexError, TypeError, AttributeError) as error:
+                last_error = GroqAPIError(
+                    f"Groq response format invalid hai: {error}",
+                    retryable=True,
+                )
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(min(4.0, float(2 ** attempt)))
 
-        except GroqAPIError as error:
-            last_error = error
-            if not error.retryable:
-                raise
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(min(4.0, float(2 ** attempt)))
+            except GroqAPIError as error:
+                last_error = error
+                if not error.retryable:
+                    raise
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(min(4.0, float(2 ** attempt)))
 
     raise last_error or GroqAPIError("Groq request failed.", retryable=True)
 
