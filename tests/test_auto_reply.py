@@ -50,8 +50,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(contacts), 1)
         self.assertFalse(contacts[0]["auto_send"])
         self.assertEqual(contacts[0]["whatsapp_name"], "Exact WhatsApp title")
-        self.assertEqual(history_limit, 10)
-        self.assertEqual(memory_limit, 10)
+        self.assertEqual(history_limit, 15)
+        self.assertEqual(memory_limit, 15)
 
     def test_string_boolean_is_rejected(self):
         payload = {
@@ -87,17 +87,17 @@ class ConfigTests(unittest.TestCase):
 
 
 class RecentHistoryTests(unittest.TestCase):
-    def test_reads_only_latest_ten_without_scrolling(self):
+    def test_reads_only_latest_fifteen_without_scrolling(self):
         visible = [
             {"id": str(index), "direction": "incoming", "text": f"message-{index}"}
-            for index in range(15)
+            for index in range(20)
         ]
         driver = Mock()
         with patch.object(auto_reply, "extract_visible_messages", return_value=visible):
-            result = auto_reply.read_recent_history(driver, 10)
+            result = auto_reply.read_recent_history(driver, 15)
 
-        self.assertEqual([item["id"] for item in result], [str(i) for i in range(5, 15)])
-        self.assertEqual(len(result), 10)
+        self.assertEqual([item["id"] for item in result], [str(i) for i in range(5, 20)])
+        self.assertEqual(len(result), 15)
         driver.execute_script.assert_not_called()
 
     def test_respects_smaller_configured_limit(self):
@@ -108,14 +108,14 @@ class RecentHistoryTests(unittest.TestCase):
 
 
 class RecentMessageArrayTests(unittest.TestCase):
-    def test_array_contains_only_nine_prior_messages_plus_latest(self):
+    def test_array_contains_up_to_fifteen_reference_messages_plus_latest(self):
         history = [
             {
                 "speaker": "Contact" if index % 2 == 0 else "You",
                 "direction": "incoming" if index % 2 == 0 else "outgoing",
                 "text": f"history-{index}",
             }
-            for index in range(15)
+            for index in range(20)
         ]
         messages = draft_reply._build_chat_messages(
             message="latest incoming",
@@ -125,10 +125,10 @@ class RecentMessageArrayTests(unittest.TestCase):
         )
 
         conversation = messages[2:]
-        self.assertEqual(len(conversation), 10)
+        self.assertEqual(len(conversation), 16)
         self.assertEqual(
             [item["content"] for item in conversation[:-1]],
-            [f"history-{index}" for index in range(6, 15)],
+            [f"history-{index}" for index in range(5, 20)],
         )
         self.assertEqual(conversation[-1], {
             "role": "user",
@@ -136,8 +136,10 @@ class RecentMessageArrayTests(unittest.TestCase):
         })
         self.assertEqual(
             [item["role"] for item in conversation[:-1]],
-            ["user", "assistant"] * 4 + ["user"],
+            ["assistant", "user"] * 7 + ["assistant"],
         )
+        self.assertIn("Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
+        self.assertIn("Do not add emojis by default", draft_reply.SYSTEM_PROMPT)
 
     def test_empty_history_still_sends_latest_message(self):
         messages = draft_reply._build_chat_messages(
@@ -183,6 +185,51 @@ class DirectionClassificationTests(unittest.TestCase):
             auto_reply._classify_message_direction(False, False, None, None, 0, 1000),
             "unknown",
         )
+
+
+class LatestPendingReplyTests(unittest.TestCase):
+    def test_only_newest_pending_message_is_sent_for_drafting(self):
+        history = [
+            {"id": "base", "speaker": "Contact", "direction": "incoming", "text": "old"},
+            {"id": "new-1", "speaker": "Contact", "direction": "incoming", "text": "Hi"},
+            {"id": "new-2", "speaker": "Contact", "direction": "incoming", "text": "Kya kr rhe ho"},
+            {"id": "new-3", "speaker": "Contact", "direction": "incoming", "text": "Pune me hu"},
+        ]
+        state = {
+            "initialized": True,
+            "last_processed_id": "base",
+            "history": history[:1],
+        }
+        contact = {
+            "phone_e164": "919876543210",
+            "name": "Testing number",
+            "relationship": "friend",
+            "memory_notes": "",
+            "tone": "warm and natural",
+            "auto_send": False,
+        }
+
+        with patch.object(auto_reply, "make_draft", return_value="Acha, kab aayi?") as draft:
+            with patch.object(auto_reply, "_write_state") as save:
+                auto_reply._handle_new_messages(
+                    driver=None,
+                    contact=contact,
+                    live=history,
+                    state=state,
+                    api_key="test-key",
+                    memory_limit=15,
+                    history_limit=15,
+                    dry_run=True,
+                )
+
+        draft.assert_called_once()
+        self.assertEqual(draft.call_args.kwargs["message"], "Pune me hu")
+        self.assertEqual(
+            [item["text"] for item in draft.call_args.kwargs["history"]],
+            ["old", "Hi", "Kya kr rhe ho"],
+        )
+        self.assertEqual(state["last_processed_id"], "new-3")
+        save.assert_called_once()
 
 
 class MessageStateTests(unittest.TestCase):
