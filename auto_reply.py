@@ -479,8 +479,14 @@ def _message_direction(driver, element) -> str:
         return driver.execute_script(
             """
             const node = arguments[0];
-            if (node.closest('.message-in')) return 'incoming';
-            if (node.closest('.message-out')) return 'outgoing';
+            if (node.closest('.message-in') || node.matches('.message-in') || node.querySelector('.message-in')) return 'incoming';
+            if (node.closest('.message-out') || node.matches('.message-out') || node.querySelector('.message-out')) return 'outgoing';
+            const marker = node.getAttribute('data-testid') || '';
+            if (marker === 'msg-container') {
+              const parent = node.parentElement;
+              if (parent?.closest('.message-in')) return 'incoming';
+              if (parent?.closest('.message-out')) return 'outgoing';
+            }
             return 'unknown';
             """,
             element,
