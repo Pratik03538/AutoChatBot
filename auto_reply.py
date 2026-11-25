@@ -1084,6 +1084,7 @@ def main() -> None:
         install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
         contacts_by_phone = {contact["phone_e164"]: contact for contact in contacts}
         retry_schedule: dict[str, tuple[float, int]] = {}
+        blocked_contacts: dict[str, str] = {}
 
         print(
             "\n[READY] Event-driven monitoring active. MutationObserver watches WhatsApp DOM "
@@ -1096,11 +1097,16 @@ def main() -> None:
             pending_contacts.clear()
             due_phones = {
                 phone for phone in requested_phones
-                if phone not in retry_schedule or retry_schedule[phone][0] <= now
+                if phone not in blocked_contacts
+                and (phone not in retry_schedule or retry_schedule[phone][0] <= now)
             }
-            pending_contacts.update(requested_phones - due_phones)
+            # Keep delayed retries queued, but never spin on a permanent provider error.
+            pending_contacts.update(
+                phone for phone in requested_phones - due_phones
+                if phone not in blocked_contacts
+            )
             for phone, (due, _attempt) in list(retry_schedule.items()):
-                if due <= now:
+                if due <= now and phone not in blocked_contacts:
                     due_phones.add(phone)
 
             for phone in due_phones:
@@ -1122,12 +1128,25 @@ def main() -> None:
                         print(f"[RETRY] {contact['name']}: Groq temporary failure; retry in {delay}s. {error}")
                     else:
                         retry_schedule.pop(phone, None)
-                        print(f"[GROQ ERROR] {contact['name']}: {error}. Message marker remains unadvanced.")
+                        blocked_contacts[phone] = str(error)
+                        pending_contacts.discard(phone)
+                        status = f" HTTP {error.status_code}" if error.status_code else ""
+                        print(
+                            f"[PAUSED] {contact['name']}: non-retryable Groq error{status}. "
+                            "Provider requests paused for this contact until the bot is restarted "
+                            "after the API issue is resolved. The incoming-message marker remains "
+                            "unadvanced; no message was sent."
+                        )
+                        print(f"[GROQ ERROR] {contact['name']}: {error}")
                 except (RuntimeError, WebDriverException) as error:
                     retry_schedule[phone] = (time.monotonic() + 15, 1)
                     print(f"[CONTACT ERROR] {contact['name']}: {error}. Retry in 15s.")
 
-            next_due = min((value[0] for value in retry_schedule.values()), default=None)
+            next_due = min(
+                (value[0] for phone, value in retry_schedule.items()
+                 if phone not in blocked_contacts),
+                default=None,
+            )
             timeout = OBSERVER_WAIT_SECONDS
             if next_due is not None:
                 timeout = min(timeout, max(0.2, next_due - time.monotonic()))
@@ -1163,6 +1182,7 @@ def main() -> None:
                         "incoming", "unread_contact", "chat_changed"
                     }
                     and str(event.get("phone")) in contacts_by_phone
+                    and str(event.get("phone")) not in blocked_contacts
                 }
                 pending_contacts.update(event_phones)
             else:
