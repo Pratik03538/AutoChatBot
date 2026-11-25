@@ -19,7 +19,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
-from draft_reply import GroqAPIError, HUMAN_REVIEW_REQUIRED, get_api_key, make_draft
+from draft_reply import (
+    RECENT_CONTEXT_MESSAGES,
+    GroqAPIError,
+    HUMAN_REVIEW_REQUIRED,
+    get_api_key,
+    make_draft,
+)
 from main import start_chrome, wait_for_whatsapp_login
 
 
@@ -395,8 +401,10 @@ def load_config() -> tuple[list[dict], int, int, bool]:
     if not country_code:
         raise ValueError("contacts.json mein country_code set karein.")
     dry_run = _strict_bool(data.get("dry_run"), "dry_run", True)
-    history_messages = max(5, min(50, int(data.get("history_messages", 25))))
-    memory_messages = max(20, min(300, int(data.get("memory_messages", 120))))
+    # Hard cap both live context and persisted conversation memory. Existing
+    # contacts.json values above 10 are safely clamped without being rewritten.
+    history_messages = max(1, min(RECENT_CONTEXT_MESSAGES, int(data.get("history_messages", RECENT_CONTEXT_MESSAGES))))
+    memory_messages = max(1, min(RECENT_CONTEXT_MESSAGES, int(data.get("memory_messages", RECENT_CONTEXT_MESSAGES))))
 
     configured = data.get("contacts")
     if not isinstance(configured, list):
@@ -685,50 +693,12 @@ def _find_message_scroller(driver):
 
 
 def read_recent_history(driver, history_limit: int) -> list[dict[str, str]]:
-    """Accumulate older virtualized messages instead of replacing each scroll slice."""
-    collected: list[dict[str, str]] = []
-    seen: set[str] = set()
-
-    for _ in range(12):
-        visible = extract_visible_messages(driver)
-        fresh = [message for message in visible if message["id"] not in seen]
-        if fresh:
-            for message in fresh:
-                seen.add(message["id"])
-            collected = fresh + collected
-
-        scroller = _find_message_scroller(driver)
-        if scroller is None:
-            break
-        try:
-            position = driver.execute_script("return arguments[0].scrollTop", scroller)
-            if position <= 1:
-                break
-            driver.execute_script(
-                "arguments[0].scrollTop = Math.max(0, arguments[0].scrollTop - "
-                "Math.max(300, arguments[0].clientHeight * 0.75))",
-                scroller,
-            )
-            time.sleep(0.2)
-        except WebDriverException:
-            break
-
-    scroller = _find_message_scroller(driver)
-    if scroller is not None:
-        try:
-            driver.execute_script(
-                "arguments[0].scrollTop = arguments[0].scrollHeight", scroller
-            )
-            time.sleep(0.2)
-        except WebDriverException:
-            pass
-
-    latest = extract_visible_messages(driver)
-    for message in latest:
-        if message["id"] not in seen:
-            seen.add(message["id"])
-            collected.append(message)
-    return collected[-history_limit:]
+    """Read only the newest rendered messages; never scroll through the conversation."""
+    limit = max(1, min(RECENT_CONTEXT_MESSAGES, int(history_limit)))
+    # WhatsApp keeps the newest conversation messages in the active DOM viewport.
+    # Extract once and take the tail rather than scrolling older virtualized history.
+    visible = extract_visible_messages(driver)
+    return visible[-limit:]
 
 
 def _merge_memory(
@@ -911,10 +881,13 @@ def _handle_new_messages(
             len(history),
         )
         prior_messages = history[:current_index] + sent_context
+        # The current incoming message is appended separately by make_draft,
+        # so reserve one of the 10 conversation slots for it.
+        prior_limit = max(0, min(history_limit, RECENT_CONTEXT_MESSAGES) - 1)
         prompt_history = [
-            {"speaker": message["speaker"], "text": message["text"]}
+            {"speaker": message["speaker"], "direction": message["direction"], "text": message["text"]}
             for message in prior_messages
-        ][-history_limit:]
+        ][-prior_limit:] if prior_limit else []
 
         # The processed marker advances only after a draft/review/send outcome.
         # A Groq failure leaves this incoming message recoverable.
@@ -1086,6 +1059,11 @@ def main() -> None:
         retry_schedule: dict[str, tuple[float, int]] = {}
         blocked_contacts: dict[str, str] = {}
 
+        print(
+            f"\n[CONTEXT] Latest {history_limit} messages maximum; full chat history is not loaded "
+            "and message-history scrolling is disabled.",
+            flush=True,
+        )
         print(
             "\n[READY] Event-driven monitoring active. MutationObserver watches WhatsApp DOM "
             "changes; fixed 12-second polling nahi hai. Ctrl+C se stop karein."
