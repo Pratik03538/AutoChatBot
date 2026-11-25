@@ -865,7 +865,6 @@ def _handle_new_messages(
             flush=True,
         )
     timeline = list(history)
-    sent_context: list[dict[str, str]] = []
     print(
         f"[MESSAGE] Incoming from {contact['name']}: {current['text'][:300]}",
         flush=True,
@@ -874,9 +873,9 @@ def _handle_new_messages(
         (index for index, message in enumerate(history) if message["id"] == current["id"]),
         len(history),
     )
-    prior_messages = history[:current_index] + sent_context
-    # The current incoming message is appended separately by make_draft,
-    # so reserve one of the 10 conversation slots for it.
+    prior_messages = history[:current_index]
+    # These up to 15 previous messages are context only; make_draft appends
+    # the newest incoming message separately as the only reply target.
     prior_limit = max(0, min(history_limit, RECENT_CONTEXT_MESSAGES))
     prompt_history = [
         {"speaker": message["speaker"], "direction": message["direction"], "text": message["text"]}
@@ -945,7 +944,6 @@ def _handle_new_messages(
         len(timeline) - 1,
     )
     timeline.insert(timeline_index + 1, assistant_message)
-    sent_context.append(assistant_message)
     state["last_processed_id"] = current["id"]
     state.pop("pending_send", None)
     state["history"] = timeline[-memory_limit:]
@@ -1054,8 +1052,8 @@ def main() -> None:
         blocked_contacts: dict[str, str] = {}
 
         print(
-            f"\n[CONTEXT] Latest {history_limit} messages maximum; full chat history is not loaded "
-            "and message-history scrolling is disabled.",
+            f"\n[CONTEXT] Up to {history_limit} previous messages are reference only; "
+            "the newest incoming message is the sole reply target. No chat-history scrolling.",
             flush=True,
         )
         print(
