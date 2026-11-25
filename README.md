@@ -135,7 +135,7 @@ Run the standard-library test suite:
 python -m unittest discover -s tests -v
 ```
 
-The tests validate phone/config parsing, safe defaults, message-state behavior and bounded Groq retry handling. They do not replace a live WhatsApp Web test.
+The tests validate phone/config parsing, safe defaults, message-state behavior, non-retryable Groq 403 handling, and the 10-message no-scroll reader plus role-preserving request array. They do not replace a live WhatsApp Web or live Groq API test.
 
 ## Other modes
 
