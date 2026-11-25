@@ -79,6 +79,18 @@ The example number is a placeholder. Replace it before enabling a contact. A 10-
 - Once the `[READY]` message appears, the MutationObserver monitors new incoming messages and unread chat-list changes.
 - Stop the run with Ctrl+C or the PyCharm stop control.
 
+### Terminal diagnostics
+
+A healthy run prints an observer-install line and then an `[WAIT] Alive` status approximately every 15 seconds when idle. When WhatsApp mutates the active chat or a configured chat-list row, it prints an `[EVENT]` line. Newly extracted incoming text appears as `[MESSAGE]`; draft-only mode prints the Groq reply as `[DRY RUN]`.
+
+Check these diagnostic fields:
+- `incoming_nodes`: visible WhatsApp incoming message containers in the active chat.
+- `message_containers`: visible message wrappers recognised by the current selector.
+- `mutations`: how many WhatsApp DOM mutation callbacks the observer has seen.
+- `matched_rows`: configured contact rows successfully matched in the chat list.
+
+If `mutations=0`, check that WhatsApp Web is fully loaded and the observer is still installed. If mutations increase but `incoming_nodes=0`, the WhatsApp Web message selectors likely need updating. If incoming nodes are present but no `[MESSAGE]` appears, check the saved message marker in local `chat_data/`; don't delete that state because it protects against duplicates.
+
 You may also run:
 
 ```cmd
