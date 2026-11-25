@@ -877,7 +877,7 @@ def _handle_new_messages(
     prior_messages = history[:current_index] + sent_context
     # The current incoming message is appended separately by make_draft,
     # so reserve one of the 10 conversation slots for it.
-    prior_limit = max(0, min(history_limit, RECENT_CONTEXT_MESSAGES) - 1)
+    prior_limit = max(0, min(history_limit, RECENT_CONTEXT_MESSAGES))
     prompt_history = [
         {"speaker": message["speaker"], "direction": message["direction"], "text": message["text"]}
         for message in prior_messages
@@ -898,7 +898,7 @@ def _handle_new_messages(
         state["history"] = history[-memory_limit:]
         _write_state(contact["phone_e164"], state)
         print(f"[REVIEW] {contact['name']}: sensitive/ambiguous message; human review needed.")
-        continue
+        return
 
     if not contact["auto_send"] or dry_run:
         mode = "DRY RUN" if dry_run else "DRAFT ONLY"
@@ -906,7 +906,7 @@ def _handle_new_messages(
         state["last_processed_id"] = current["id"]
         state["history"] = history[-memory_limit:]
         _write_state(contact["phone_e164"], state)
-        continue
+        return
 
     # Journal the send intent before touching WhatsApp. If the process dies
     # between Enter and the state commit, startup recovery will not blindly resend.
@@ -924,7 +924,7 @@ def _handle_new_messages(
         state["history"] = history[-memory_limit:]
         _write_state(contact["phone_e164"], state)
         print(f"[SEND CHECK] {contact['name']}: {error}")
-        continue
+        return
     except RuntimeError:
         # These errors occur before a send attempt (e.g. composer missing or
         # an existing unsent draft); clear the journal so a safe retry can run.
