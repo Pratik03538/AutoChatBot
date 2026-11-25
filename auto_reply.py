@@ -102,9 +102,15 @@ const messageIdentity = element => {
     : (element.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "");
 };
 const activeContact = () => {
-  if (state.activePhone) return contacts.find(c => c.phone_e164 === state.activePhone) || null;
   const header = document.querySelector('#main header [data-testid="conversation-header"] [title], #main header span[title], [data-testid="conversation-header"] [title]');
-  return header ? contactForLabel(header.getAttribute("title")) : null;
+  if (header) {
+    // If a person manually changes chats, never attribute that chat to the last
+    // automated contact. Unmapped titles are deliberately ignored.
+    return contactForLabel(header.getAttribute("title"));
+  }
+  return state.activePhone
+    ? (contacts.find(c => c.phone_e164 === state.activePhone) || null)
+    : null;
 };
 const unreadPresent = row => {
   const indicators = row.querySelectorAll(
