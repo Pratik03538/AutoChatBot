@@ -13,6 +13,8 @@ __pycache__/
 .env.*
 !.env.example
 contacts.json
+contacts.json.backup-*
+contacts.json.tmp
 *.log
 logs/
 chat_data/
