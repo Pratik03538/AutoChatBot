@@ -141,7 +141,7 @@ class RecentMessageArrayTests(unittest.TestCase):
             ["assistant", "user"] * 7 + ["assistant"],
         )
         self.assertIn("Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
-        self.assertIn("Do not add emojis by default", draft_reply.SYSTEM_PROMPT)
+        self.assertIn("do not add emojis by default", draft_reply.SYSTEM_PROMPT)
         self.assertIn("casual Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
         self.assertIn("never flirt", draft_reply.SYSTEM_PROMPT)
         self.assertIn("Never use pet names", draft_reply.SYSTEM_PROMPT)
