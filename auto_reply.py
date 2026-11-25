@@ -1,9 +1,8 @@
 """Event-driven WhatsApp Web auto-replies for explicitly configured contacts.
 
-The browser-side MutationObserver detects message and unread-list DOM changes.
-Selenium waits on an asynchronous browser-side event queue instead of polling
-WhatsApp every N seconds. This remains dependent on WhatsApp Web's DOM and
-network delivery; it cannot provide a hard real-time or zero-latency guarantee.
+A browser-side MutationObserver detects incoming message and chat-list DOM changes.
+Selenium waits on that event queue instead of polling WhatsApp at a fixed interval.
+WhatsApp Web and Groq network/inference latency mean zero-second delivery cannot be guaranteed.
 """
 
 from __future__ import annotations
@@ -39,27 +38,25 @@ COMPOSER_SELECTORS = (
 MAX_MESSAGE_CHARS = 700
 OBSERVER_WAIT_SECONDS = 15
 
-# This code runs in WhatsApp Web. It only observes the active conversation and
-# configured chat-list rows; it does not click, send, or alter page content.
+
 OBSERVER_INSTALL_SCRIPT = r"""
 const contacts = arguments[0] || [];
 const activePhone = arguments[1] || null;
 const emitInitialUnread = Boolean(arguments[2]);
+if (window.__autochatObserver?.observer) window.__autochatObserver.observer.disconnect();
 
-if (window.__autochatObserver?.observer) {
-  window.__autochatObserver.observer.disconnect();
-}
+const eventKey = event => [
+  event.type, event.phone || "", event.message_id || "", event.snapshot || ""
+].join("|");
+const takeEvents = () => {
+  const items = state.events.splice(0, state.events.length);
+  for (const item of items) state.eventKeys.delete(eventKey(item));
+  return items;
+};
 const state = {
-  contacts,
-  activePhone,
-  events: [],
-  waiters: [],
-  seenMessages: new Set(),
-  rowSnapshots: new Map(),
-  initialized: false,
-  observer: null,
-  scheduled: false,
-  eventKeys: new Set()
+  contacts, activePhone, events: [], waiters: [], seenMessages: new Set(),
+  rowSnapshots: new Map(), initialized: false, observer: null,
+  scheduled: false, eventKeys: new Set()
 };
 window.__autochatObserver = state;
 
@@ -70,18 +67,18 @@ const contactForLabel = label => {
   return contacts.find(c => norm(c.whatsapp_name) === key) || null;
 };
 const pushEvent = event => {
-  const key = [event.type, event.phone || "", event.message_id || "", event.snapshot || ""].join("|");
+  const key = eventKey(event);
   if (state.eventKeys.has(key)) return;
   state.eventKeys.add(key);
   state.events.push(event);
   while (state.events.length > 500) {
     const dropped = state.events.shift();
-    state.eventKeys.delete([dropped.type, dropped.phone || "", dropped.message_id || "", dropped.snapshot || ""].join("|"));
+    state.eventKeys.delete(eventKey(dropped));
   }
   while (state.waiters.length && state.events.length) {
     const waiter = state.waiters.shift();
     clearTimeout(waiter.timer);
-    waiter.done(state.events.splice(0, state.events.length));
+    waiter.done(takeEvents());
   }
 };
 const readText = element => {
@@ -100,14 +97,13 @@ const messageIdentity = element => {
   const holder = element.matches("[data-id]") ? element : element.querySelector("[data-id]");
   const id = holder?.getAttribute("data-id");
   if (id) return id;
-  const tagged = element.matches("[data-pre-plain-text]")
-    ? element.getAttribute("data-pre-plain-text")
-    : element.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text");
-  return tagged || "";
+  return element.matches("[data-pre-plain-text]")
+    ? (element.getAttribute("data-pre-plain-text") || "")
+    : (element.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "");
 };
 const activeContact = () => {
   if (state.activePhone) return contacts.find(c => c.phone_e164 === state.activePhone) || null;
-  const header = document.querySelector('#main header [title], [data-testid="conversation-header"] [title]');
+  const header = document.querySelector('#main header [data-testid="conversation-header"] [title], #main header span[title], [data-testid="conversation-header"] [title]');
   return header ? contactForLabel(header.getAttribute("title")) : null;
 };
 const unreadPresent = row => {
@@ -123,10 +119,12 @@ const unreadPresent = row => {
   return /\bunread\b|\bnew messages?\b/i.test(accessible);
 };
 const rowLabel = row => {
-  const titled = row.querySelector('[data-testid="cell-frame-title"][title], span[title], [title]');
-  if (titled?.getAttribute("title")) return titled.getAttribute("title");
-  const labelled = row.querySelector("[aria-label]");
-  return labelled?.getAttribute("aria-label") || "";
+  const titleNode =
+    row.querySelector('[data-testid="cell-frame-title"][title]') ||
+    row.querySelector('span[title]') ||
+    row.querySelector('[title]');
+  if (titleNode?.getAttribute("title")) return titleNode.getAttribute("title");
+  return row.querySelector("[aria-label]")?.getAttribute("aria-label") || "";
 };
 const scan = () => {
   const first = !state.initialized;
@@ -144,19 +142,13 @@ const scan = () => {
       const text = readText(node);
       if (!text) continue;
       const rawId = messageIdentity(node);
-      const id = rawId || (incoming ? "in:" : "out:") + text;
+      const id = rawId || ((incoming ? "in:" : "out:") + text);
       const unique = phone + "|" + id + "|" + (incoming ? "in" : "out");
       if (first) {
         state.seenMessages.add(unique);
       } else if (incoming && !state.seenMessages.has(unique)) {
         state.seenMessages.add(unique);
-        pushEvent({
-          type: "incoming",
-          phone,
-          message_id: rawId,
-          text,
-          observed_at: Date.now()
-        });
+        pushEvent({type: "incoming", phone, message_id: rawId, text, observed_at: Date.now()});
       } else {
         state.seenMessages.add(unique);
       }
@@ -170,8 +162,7 @@ const scan = () => {
     );
     for (const row of rows) {
       if (!row.isConnected) continue;
-      const label = rowLabel(row);
-      const contact = contactForLabel(label);
+      const contact = contactForLabel(rowLabel(row));
       if (!contact) continue;
       const unread = unreadPresent(row);
       const snapshot = norm(row.innerText || "") + "|" + norm(row.getAttribute("aria-label") || "") + "|" + unread;
@@ -195,7 +186,7 @@ const scheduleScan = () => {
   state.scheduled = true;
   queueMicrotask(() => {
     state.scheduled = false;
-    try { scan(); } catch (error) { /* a transient WhatsApp DOM change is harmless */ }
+    try { scan(); } catch (error) { /* transient WhatsApp DOM changes are harmless */ }
   });
 };
 
@@ -203,10 +194,7 @@ try {
   scan();
   state.observer = new MutationObserver(scheduleScan);
   state.observer.observe(document.body, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-    attributes: true,
+    subtree: true, childList: true, characterData: true, attributes: true,
     attributeFilter: ["aria-label", "data-testid", "title", "class"]
   });
   return {installed: true, mappedContacts: contacts.length};
@@ -220,7 +208,15 @@ const timeoutMs = Math.max(100, Number(arguments[0] || 15000));
 const done = arguments[arguments.length - 1];
 const state = window.__autochatObserver;
 if (!state) return done([]);
-if (state.events.length) return done(state.events.splice(0, state.events.length));
+const takeEvents = () => {
+  const items = state.events.splice(0, state.events.length);
+  for (const item of items) {
+    const key = [item.type, item.phone || "", item.message_id || "", item.snapshot || ""].join("|");
+    state.eventKeys.delete(key);
+  }
+  return items;
+};
+if (state.events.length) return done(takeEvents());
 let settled = false;
 const waiter = {
   done: events => {
@@ -239,6 +235,7 @@ waiter.timer = setTimeout(() => {
 }, timeoutMs);
 state.waiters.push(waiter);
 """
+
 
 def normalize_phone(raw_phone: str, country_code: str) -> str:
     """Return a validated digits-only international phone number."""
@@ -364,8 +361,13 @@ def install_dom_observer(driver, contacts: list[dict], active_phone: str | None,
 
 
 def wait_for_dom_events(driver, timeout_seconds: float = OBSERVER_WAIT_SECONDS) -> list[dict]:
-    """Wait for MutationObserver events; there is no periodic DOM polling."""
+    """Wait on the MutationObserver queue, without fixed-interval DOM polling."""
     try:
+        observer_exists = driver.execute_script(
+            "return Boolean(window.__autochatObserver && window.__autochatObserver.observer)"
+        )
+        if not observer_exists:
+            return [{"type": "observer_missing"}]
         result = driver.execute_async_script(
             OBSERVER_WAIT_SCRIPT, int(max(0.1, timeout_seconds) * 1000)
         )
@@ -529,11 +531,7 @@ def _merge_memory(
         return live[-memory_limit:]
     saved_index = {message.get("id"): index for index, message in enumerate(saved)}
     overlap = next(
-        (
-            saved_index[message.get("id")]
-            for message in live
-            if message.get("id") in saved_index
-        ),
+        (saved_index[message.get("id")] for message in live if message.get("id") in saved_index),
         None,
     )
     combined = saved[:overlap] + live if overlap is not None else live
@@ -565,18 +563,14 @@ def _read_state(phone: str) -> dict:
         value.setdefault("history", [])
         return value
     except (OSError, json.JSONDecodeError, ValueError):
-        # Corrupt state is preserved for inspection; do not silently overwrite it.
-        raise RuntimeError(f"Local chat state corrupt hai: {path}. Backup karke inspect karein.")
+        raise RuntimeError(f"Local chat state corrupt hai: {path}. Backup karke inspect karein.") from None
 
 
 def _write_state(phone: str, state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     path = _state_file(phone)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
 
 
@@ -612,14 +606,14 @@ def _send_message(driver, draft: str) -> bool:
     attempted = False
     try:
         composer.click()
-        attempted = True
         composer.send_keys(text)
+        attempted = True
         composer.send_keys(Keys.ENTER)
     except WebDriverException as error:
         if attempted:
             raise SendUncertain(
-                "Send action ke baad browser error aaya; duplicate se bachne ke liye "
-                "automatic resend nahi kiya. WhatsApp chat manually verify karein."
+                "Send ke baad browser error aaya; duplicate se bachne ke liye auto-resend nahi kiya. "
+                "WhatsApp chat manually verify karein."
             ) from error
         raise
 
@@ -642,7 +636,7 @@ def _send_message(driver, draft: str) -> bool:
 
 
 class SendUncertain(RuntimeError):
-    """The send action may have reached WhatsApp, so automatic resend is unsafe."""
+    """The send may have reached WhatsApp, so automatic resend is unsafe."""
 
 
 def _pending_messages(history: list[dict[str, str]], state: dict) -> list[dict[str, str]]:
@@ -652,10 +646,14 @@ def _pending_messages(history: list[dict[str, str]], state: dict) -> list[dict[s
         return incoming
     ids = [message["id"] for message in history]
     if marker not in ids:
-        # Conservative stop: if history truncation removed the marker, don't risk
-        # replying to an old message or duplicating a message already handled.
         if incoming and incoming[-1]["id"] != marker:
-            print("[SKIP] Last processed marker history mein nahi mila; duplicate risk ke kaaran auto-send roka.")
+            print(
+                "[SKIP] Last processed marker history se bahar hai; uncertain backlog skip "
+                "kiya aur future messages ke liye baseline latest incoming par advance ki."
+            )
+            # The current bounded history cannot establish which messages are new.
+            # Skip this ambiguous backlog once, but recover the watcher for later messages.
+            state["last_processed_id"] = incoming[-1]["id"]
         return []
     marker_index = ids.index(marker)
     return [
@@ -696,12 +694,11 @@ def _handle_new_messages(
     for current in pending:
         prompt_history = [
             {"speaker": message["speaker"], "text": message["text"]}
-            for message in timeline
-            if message["id"] != current["id"]
+            for message in timeline if message["id"] != current["id"]
         ][-history_limit:]
 
-        # Do not advance the processed marker before Groq succeeds. Transient API
-        # failures therefore remain recoverable instead of silently losing replies.
+        # The processed marker advances only after a draft/review/send outcome.
+        # A Groq failure leaves this incoming message recoverable.
         draft = make_draft(
             api_key=api_key,
             message=current["text"],
@@ -750,7 +747,7 @@ def _handle_new_messages(
 
 
 def _baseline_contact(driver, contact: dict, history_limit: int, memory_limit: int) -> bool:
-    """Create a safe startup baseline, or report whether old pending messages exist."""
+    """Create a safe startup baseline, or report whether previously pending messages exist."""
     open_contact_chat(driver, contact)
     live = read_recent_history(driver, memory_limit)
     state = _read_state(contact["phone_e164"])
@@ -785,7 +782,6 @@ def _process_contact(
     if active_phone != contact["phone_e164"]:
         open_contact_chat(driver, contact)
         active_phone = contact["phone_e164"]
-        # Navigation can replace the DOM and destroy the previous observer.
         install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
 
     live = read_recent_history(driver, memory_limit)
@@ -815,8 +811,6 @@ def main() -> None:
         driver.get("https://web.whatsapp.com/")
         wait_for_whatsapp_login(driver)
 
-        # One-time warm-up creates per-contact message markers. Once monitoring
-        # starts, only messages arriving after each marker can trigger replies.
         pending_contacts: set[str] = set()
         active_phone: str | None = None
         for contact in contacts:
@@ -833,12 +827,11 @@ def main() -> None:
         retry_schedule: dict[str, tuple[float, int]] = {}
 
         print(
-            "\n[READY] Event-driven monitoring active. MutationObserver WhatsApp DOM changes "
-            "detect karega; fixed 12-second polling nahi hai. Ctrl+C se stop karein."
+            "\n[READY] Event-driven monitoring active. MutationObserver watches WhatsApp DOM "
+            "changes; fixed 12-second polling nahi hai. Ctrl+C se stop karein."
         )
 
         while True:
-            # Recover messages that were pending at startup or failed transiently.
             now = time.monotonic()
             due_phones = set(pending_contacts)
             pending_contacts.clear()
@@ -876,16 +869,18 @@ def main() -> None:
                 timeout = min(timeout, max(0.2, next_due - time.monotonic()))
 
             events = wait_for_dom_events(driver, timeout)
-            # Coalesce a burst into one contact visit. The chat history reader then
-            # processes all incoming messages after that contact's saved marker.
+            if any(event.get("type") == "observer_missing" for event in events):
+                print("[OBSERVER] WhatsApp page reloaded; reinstalling MutationObserver.")
+                install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
+                continue
+
             event_phones = {
                 str(event.get("phone"))
                 for event in events
                 if event.get("type") in {"incoming", "unread_contact"}
                 and str(event.get("phone")) in contacts_by_phone
             }
-            for phone in event_phones:
-                pending_contacts.add(phone)
+            pending_contacts.update(event_phones)
 
     except (EOFError, KeyboardInterrupt):
         print("\nAutoChatBot band ho gaya.")
