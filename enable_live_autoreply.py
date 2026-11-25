@@ -47,8 +47,8 @@ def update_live_mode(config_path: Path, contact_name: str | None, enable_live: b
         if len(enabled) != 1 or len(matches) != 1:
             enabled_names = [str(item.get("name") or "(unnamed)") for item in enabled]
             raise ValueError(
-                "Safety stop: live mode sirf tab enable hoga jab exactly one enabled contact "
-                f"enabled ho aur uska name {contact_name!r} ho. Enabled contacts: {enabled_names}"
+                "Safety stop: live mode can only be enabled when exactly one contact is enabled "
+                f"and its name exactly matches {contact_name!r}. Enabled contacts: {enabled_names}"
             )
 
         target = matches[0]
