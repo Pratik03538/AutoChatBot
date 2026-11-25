@@ -677,21 +677,6 @@ def extract_visible_messages(driver) -> list[dict[str, str]]:
     return records
 
 
-def _find_message_scroller(driver):
-    return driver.execute_script(
-        """
-        const root = document.querySelector('#main');
-        if (!root) return null;
-        const nodes = [root, ...root.querySelectorAll('*')];
-        const scrollable = nodes.filter(
-          node => node.clientHeight > 120 && node.scrollHeight > node.clientHeight + 80
-        );
-        scrollable.sort((a, b) => b.scrollHeight - a.scrollHeight);
-        return scrollable[0] || null;
-        """
-    )
-
-
 def read_recent_history(driver, history_limit: int) -> list[dict[str, str]]:
     """Read only the newest rendered messages; never scroll through the conversation."""
     limit = max(1, min(RECENT_CONTEXT_MESSAGES, int(history_limit)))
