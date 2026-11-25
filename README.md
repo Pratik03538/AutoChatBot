@@ -60,7 +60,7 @@ Example contact configuration:
       "name": "Local label for this contact",
       "whatsapp_name": "Exact saved name shown in WhatsApp",
       "relationship": "friend",
-      "tone": "warm and natural",
+      "tone": "casual, natural and understated",
       "memory_notes": "",
       "enabled": true,
       "auto_send": false
