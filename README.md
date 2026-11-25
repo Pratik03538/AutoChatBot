@@ -102,25 +102,37 @@ Or double-click `run_auto_reply.cmd`; it prefers `.venv`, supports the older `ve
 
 ## Enabling real automatic sending
 
-Only after testing drafts and confirming the exact contact mapping:
+The repository template stays safe by default (`dry_run: true`, `auto_send: false`). After reviewing generated drafts and confirming the exact chat mapping and the recipient's agreement, use the guarded local switch:
 
-- Set global `dry_run` to `false`.
-- Set `auto_send` to `true` only for the individual contacts that explicitly agreed to receive automated replies.
-- Leave all other contacts disabled or in draft-only mode.
+```cmd
+.\venv\Scripts\python.exe enable_live_autoreply.py --contact-name "Testing number" --enable-live
+```
 
-Both controls are required. A contact with `auto_send: true` still will not receive messages while global `dry_run: true`.
+Replace `Testing number` with the exact `name` value in your local `contacts.json`. The command:
+- Requires exactly one enabled contact and an exact name match. It refuses to enable live sending if multiple contacts are enabled.
+- Sets global `dry_run: false` and `auto_send: true` only for that contact. It also sets the tone to casual, natural and understated.
+- Creates a timestamped backup of the previous `contacts.json` before changing it. These backups are ignored by Git.
 
-The program only monitors contacts in the local `contacts.json`. Do not configure people who have not agreed to automated replies. Keep replies personal, relevant and low volume; do not use this tool for bulk messaging or unsolicited outreach.
+To turn live sending off immediately:
+
+```cmd
+.\venv\Scripts\python.exe enable_live_autoreply.py --disable-live
+```
+
+That command restores `dry_run: true` and sets `auto_send: false` for every contact. Restart the bot after either change because settings are loaded at startup.
+
+The program only monitors contacts in the local `contacts.json`. Enable automatic replies only for recipients who explicitly agreed to receive them. Keep replies personal, relevant and low volume; do not use this tool for bulk messaging or unsolicited outreach.
 
 ## Groq and privacy
 
 The local `.env` file contains the private API key. Up to 15 previous conversation messages are sent to Groq as reference, followed by the newest incoming message as the only reply target, plus configured style notes. The bot does not scroll backward or load the full conversation. Up to 15 recent message records, phone numbers, session cookies and processing state remain in local files excluded from Git. Avoid putting sensitive personal information in chat notes or sending sensitive conversations to an external model.
 
-The reply prompt asks Groq to match the incoming message's language, use history only as context, avoid inventing facts, and defer sensitive/ambiguous medical, legal, financial, safety or serious-conflict messages to a human. These checks reduce risk but cannot guarantee a correct reply. Review real-send behavior carefully.
+The reply prompt asks Groq to match the incoming message's language and use history only as context. It enforces a neutral, non-romantic style and rejects drafts containing common pet names, romantic phrases or romantic emojis; sensitive/ambiguous medical, legal, financial, safety or serious-conflict messages are deferred to a human. These checks reduce risk but cannot guarantee a correct reply. Review real-send behavior carefully.
 
 ## Failure handling
 
-- Uses the official Groq Python SDK for chat completions. Transient network, timeout, rate-limit and server errors receive bounded retries with SDK retries disabled to avoid retry multiplication.
+- Uses the official Groq Python SDK for GPT-OSS 20B with low reasoning effort, reasoning hidden from the text response, and a 1,024-token completion budget. Empty completions include finish-reason diagnostics.
+- Transient network, timeout, rate-limit and server errors receive bounded retries with SDK retries disabled to avoid retry multiplication.
 - Non-retryable Groq errors (including HTTP 403) pause provider calls for that contact until the bot is restarted after the provider issue is resolved. The incoming-message marker remains unadvanced so the message is not silently discarded.
 - Authentication/configuration errors are reported without marking the incoming message as processed.
 - If WhatsApp send confirmation is uncertain, the message is not automatically resent; manually inspect the chat to avoid duplicates.
@@ -135,7 +147,7 @@ Run the standard-library test suite:
 python -m unittest discover -s tests -v
 ```
 
-The tests validate phone/config parsing, safe defaults, latest-pending-only reply behavior, casual Roman Hindi/Hinglish prompt rules, non-retryable Groq 403 handling, and the 15-message no-scroll reference reader plus role-preserving request array. They do not replace a live WhatsApp Web or live Groq API test.
+The tests validate phone/config parsing, guarded live-mode configuration and backups, latest-pending-only reply behavior, stable message identity across WhatsApp DOM re-renders, neutral Roman Hindi/Hinglish style enforcement, Groq GPT-OSS token/reasoning settings, non-retryable Groq 403 handling, and the 15-message no-scroll reference reader plus role-preserving request array. They do not replace a live WhatsApp Web or live Groq API test.
 
 ## Other modes
 
