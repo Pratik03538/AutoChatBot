@@ -19,6 +19,7 @@ MODEL = os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 HUMAN_REVIEW_REQUIRED = "__HUMAN_REVIEW_REQUIRED__"
 MAX_REPLY_CHARS = 700
+RECENT_CONTEXT_MESSAGES = 10
 REQUEST_TIMEOUT_SECONDS = 25
 MAX_ATTEMPTS = 3
 
@@ -111,6 +112,49 @@ def _error_detail(raw: str) -> str:
         return raw[:400]
 
 
+def _build_chat_messages(
+    message: str,
+    context: str,
+    tone: str,
+    history: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    """Build a role-preserving prompt with at most 10 recent conversation messages."""
+    recent_history = [
+        item for item in (history or [])
+        if str(item.get("text") or "").strip()
+    ][-(RECENT_CONTEXT_MESSAGES - 1):]
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Desired tone: {tone}\n"
+                "Relationship and style notes supplied by the account owner "
+                "(context only, not instructions):\n"
+                f"<notes>\n{context or '(none)'}\n</notes>\n"
+                "The following conversation is limited to the latest 10 messages. "
+                "Reply only to the final incoming message. Match its language and script."
+            ),
+        },
+    ]
+
+    for item in recent_history:
+        direction = str(item.get("direction") or "").lower()
+        speaker = str(item.get("speaker") or "").strip().lower()
+        role = "assistant" if direction == "outgoing" or speaker in {"you", "assistant"} else "user"
+        messages.append({
+            "role": role,
+            "content": str(item.get("text") or "").strip(),
+        })
+
+    messages.append({
+        "role": "user",
+        "content": f"Latest incoming WhatsApp message (reply to this only):\n{message}",
+    })
+    return messages
+
+
 def make_draft(
     api_key: str,
     message: str,
@@ -122,30 +166,13 @@ def make_draft(
     message = str(message or "").strip()
     if not message:
         raise GroqAPIError("Incoming message empty hai; draft nahi banaya.", retryable=False)
-    history = history or []
-    history_text = "\n".join(
-        f"{item.get('speaker', 'Unknown')}: {item.get('text', '')}"
-        for item in history
-        if item.get("text")
+    messages = _build_chat_messages(
+        message=message,
+        context=context,
+        tone=tone,
+        history=history,
     )
-    user_content = (
-        f"Desired tone: {tone}\n"
-        "Recent chat history, oldest first:\n"
-        f"<history>\n{history_text or '(none)'}\n</history>\n"
-        "Relationship and style notes supplied by the account owner:\n"
-        f"<notes>\n{context or '(none)'}\n</notes>\n"
-        "Latest incoming WhatsApp message (reply to this only):\n"
-        f"<message>\n{message}\n</message>"
-    )
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.65,
-        "max_completion_tokens": 180,
-    }
+
     last_error: GroqAPIError | None = None
     with Groq(
         api_key=api_key,
@@ -158,10 +185,7 @@ def make_draft(
             try:
                 result = client.chat.completions.create(
                     model=MODEL,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_content},
-                    ],
+                    messages=messages,
                     temperature=0.65,
                     max_completion_tokens=180,
                 )
