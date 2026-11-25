@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 import auto_reply
@@ -30,6 +30,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_dry_run_defaults_to_true_and_contact_is_disabled_by_default(self):
         payload = {
+            "history_messages": 25,
+            "memory_messages": 120,
             "contacts": [
                 {
                     "phone": "9876543210",
@@ -90,17 +92,13 @@ class RecentHistoryTests(unittest.TestCase):
             {"id": str(index), "direction": "incoming", "text": f"message-{index}"}
             for index in range(15)
         ]
+        driver = Mock()
         with patch.object(auto_reply, "extract_visible_messages", return_value=visible):
-            with patch.object(
-                auto_reply,
-                "_find_message_scroller",
-                side_effect=AssertionError("history reader must not scroll"),
-            ) as scroll:
-                result = auto_reply.read_recent_history(object(), 10)
+            result = auto_reply.read_recent_history(driver, 10)
 
         self.assertEqual([item["id"] for item in result], [str(i) for i in range(5, 15)])
         self.assertEqual(len(result), 10)
-        scroll.assert_not_called()
+        driver.execute_script.assert_not_called()
 
     def test_respects_smaller_configured_limit(self):
         visible = [{"id": str(index), "text": str(index)} for index in range(10)]
@@ -134,7 +132,7 @@ class RecentMessageArrayTests(unittest.TestCase):
         )
         self.assertEqual(conversation[-1], {
             "role": "user",
-            "content": "Latest incoming WhatsApp message (reply to this only):\\nlatest incoming",
+            "content": "Latest incoming WhatsApp message (reply to this only):" + "\n" + "latest incoming",
         })
         self.assertEqual(
             [item["role"] for item in conversation[:-1]],
