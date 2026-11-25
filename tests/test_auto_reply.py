@@ -321,8 +321,8 @@ class LiveModeConfigTests(unittest.TestCase):
             )
             saved = json.loads(path.read_text(encoding="utf-8"))
             before = json.loads(backup.read_text(encoding="utf-8"))
+            self.assertTrue(backup.is_file())
 
-        self.assertTrue(backup.is_file())
         self.assertTrue(before["dry_run"])
         self.assertFalse(saved["dry_run"])
         self.assertTrue(saved["contacts"][0]["auto_send"])
