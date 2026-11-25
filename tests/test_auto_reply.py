@@ -140,6 +140,9 @@ class RecentMessageArrayTests(unittest.TestCase):
         )
         self.assertIn("Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
         self.assertIn("Do not add emojis by default", draft_reply.SYSTEM_PROMPT)
+        self.assertIn("casual Roman Hindi/Hinglish", draft_reply.SYSTEM_PROMPT)
+        self.assertIn("Never exceed 300 characters", draft_reply.SYSTEM_PROMPT)
+        self.assertEqual(draft_reply.MAX_REPLY_CHARS, 300)
 
     def test_empty_history_still_sends_latest_message(self):
         messages = draft_reply._build_chat_messages(
