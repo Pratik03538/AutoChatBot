@@ -119,7 +119,8 @@ The reply prompt asks Groq to match the incoming message's language, use history
 
 ## Failure handling
 
-- Transient Groq network, timeout, rate-limit and server errors receive bounded retries. Unprocessed messages remain recoverable and can be retried.
+- Uses the official Groq Python SDK for chat completions. Transient network, timeout, rate-limit and server errors receive bounded retries with SDK retries disabled to avoid retry multiplication.
+- Non-retryable Groq errors (including HTTP 403) pause provider calls for that contact until the bot is restarted after the provider issue is resolved. The incoming-message marker remains unadvanced so the message is not silently discarded.
 - Authentication/configuration errors are reported without marking the incoming message as processed.
 - If WhatsApp send confirmation is uncertain, the message is not automatically resent; manually inspect the chat to avoid duplicates.
 - If the saved history marker is no longer present in the visible history, the bot skips that uncertain backlog rather than risk replying twice.
