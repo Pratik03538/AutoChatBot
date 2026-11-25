@@ -827,6 +827,7 @@ def main() -> None:
                 if has_pending:
                     pending_contacts.add(contact["phone_e164"])
             except (RuntimeError, WebDriverException) as error:
+                active_phone = None
                 print(f"[WARMUP ERROR] {contact['name']}: {error}")
 
         install_dom_observer(driver, contacts, active_phone, emit_initial_unread=True)
@@ -840,8 +841,13 @@ def main() -> None:
 
         while True:
             now = time.monotonic()
-            due_phones = set(pending_contacts)
+            requested_phones = set(pending_contacts)
             pending_contacts.clear()
+            due_phones = {
+                phone for phone in requested_phones
+                if phone not in retry_schedule or retry_schedule[phone][0] <= now
+            }
+            pending_contacts.update(requested_phones - due_phones)
             for phone, (due, _attempt) in list(retry_schedule.items()):
                 if due <= now:
                     due_phones.add(phone)
