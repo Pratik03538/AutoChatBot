@@ -1,0 +1,27 @@
+# Persistent Chrome profile contains WhatsApp authentication cookies and session data.
+chrome_profile/
+chrome-profile/
+
+# Python environments and generated files.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local credentials, logs, and chat exports.
+.env
+.env.*
+!.env.example
+*.log
+logs/
+chat_data/
+chat_exports/
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
